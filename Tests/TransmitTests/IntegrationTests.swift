@@ -33,7 +33,8 @@ final class IntegrationTests: XCTestCase {
             return data
         }
         func history() async throws -> [[String: Any]] {
-            try await JSONSerialization.jsonObject(with: call("history")) as! [[String: Any]]
+            let data = try await call("history")
+            return try JSONSerialization.jsonObject(with: data) as! [[String: Any]]
         }
         func count(_ path: String, uid: String? = nil) async throws -> Int {
             let rows = try await history()
@@ -98,7 +99,8 @@ final class IntegrationTests: XCTestCase {
         consumer.cancel()
         _ = await consumer.result
         try await eventually { try await count("unsubscribe", uid: client.uid) == 1 }
-        let rows = try await history().filter { row in
+        let recordedHistory = try await history()
+        let rows = recordedHistory.filter { row in
             let body = row["body"] as? [String: Any], query = row["query"] as? [String: Any]
             return body?["uid"] as? String == client.uid || query?["uid"] as? String == client.uid
         }
