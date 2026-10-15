@@ -32,3 +32,22 @@ jobs:
           xcodebuild -scheme "$scheme" -destination 'generic/platform=iOS' \
             -derivedDataPath .build/ios IPHONEOS_DEPLOYMENT_TARGET=15.0 \
             CODE_SIGNING_ALLOWED=NO build
+  swift6:
+    name: Swift 6 strict concurrency
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: Tests/IntegrationServer/package-lock.json
+      - name: Build in Swift 6 language mode (warnings are errors)
+        run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+      - name: Install real AdonisJS integration server
+        run: npm ci --prefix Tests/IntegrationServer --no-audit --no-fund
+      - name: Swift 6 unit and integration tests
+        run: TRANSMIT_INTEGRATION=1 swift test --enable-code-coverage -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+      - name: Require 100% library coverage in Swift 6
+        run: python3 scripts/check-coverage.py

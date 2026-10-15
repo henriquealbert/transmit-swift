@@ -15,7 +15,10 @@ final class IntegrationTests: XCTestCase {
         defer { process.terminate(); process.waitUntilExit() }
         let startup = String(decoding: output.fileHandleForReading.availableData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         let base = try XCTUnwrap(URL(string: startup), "Server did not start: \(startup)")
-        let session = URLSession(configuration: .ephemeral)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 90
+        configuration.httpAdditionalHeaders = ["X-Transmit-Session": "custom"]
+        let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 
         func call(_ path: String, _ body: [String: Any]? = nil) async throws -> Data {
@@ -101,18 +104,23 @@ final class IntegrationTests: XCTestCase {
         }
         XCTAssertGreaterThan(rows.count, 6)
         for row in rows {
+            XCTAssertEqual(row["sessionHeader"] as? String, "custom")
             let token = (row["query"] as? [String: Any])?["token"] as? String
             XCTAssertEqual(row["authorization"] as? String, "Bearer \(token!)")
         }
         XCTAssertEqual(rows.last?["authorization"] as? String, "Bearer second")
         await client.close()
 
-        // Default unauthenticated provider is retried, and closing interrupts its backoff.
+        // A persistently rejected real GET must stop instead of retrying forever.
         let anonymous = try TransmitClient(baseURL: base, session: session)
         let anonymousMessages = await anonymous.messages(on: "news", as: Int.self)
-        try await eventually { try await count("events", uid: anonymous.uid) == 1 }
-        try await eventually { await anonymous.state == .reconnecting }
+        try await eventually { await anonymous.state == .authenticationFailed }
+        let anonymousError = await anonymous.lastError as? TransmitError
+        XCTAssertEqual(anonymousError, .httpStatus(401))
+        do { for try await _ in anonymousMessages { XCTFail() }; XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
+        let attempts = try await count("events", uid: anonymous.uid)
+        XCTAssertEqual(attempts, 3)
         await anonymous.close()
-        _ = anonymousMessages
     }
 }

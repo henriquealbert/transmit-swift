@@ -1,7 +1,7 @@
 import Foundation
 
 /// Failures reported by the HTTP transport and configuration validation.
-public enum TransmitError: Error, Equatable {
+public enum TransmitError: Error, Equatable, Sendable {
     case invalidBaseURL
     case invalidResponse
     case httpStatus(Int)
@@ -9,14 +9,14 @@ public enum TransmitError: Error, Equatable {
     case closed
 }
 
-struct EventConnection {
+struct EventConnection: Sendable {
     let lines: AsyncThrowingStream<String, Error>
-    let cancel: () -> Void
+    let cancel: @Sendable () -> Void
 }
 
-struct Transport {
-    var open: (URLRequest) async throws -> EventConnection
-    var send: (URLRequest) async throws -> Void
+struct Transport: Sendable {
+    var open: @Sendable (URLRequest) async throws -> EventConnection
+    var send: @Sendable (URLRequest) async throws -> Void
 
     static func validate(_ response: URLResponse, streaming: Bool) throws {
         guard let response = response as? HTTPURLResponse else {

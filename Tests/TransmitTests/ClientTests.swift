@@ -10,11 +10,18 @@ func eventually(_ condition: @escaping () async throws -> Bool, file: StaticStri
     throw URLError(.timedOut)
 }
 
+final class WeakReference<Value: AnyObject> {
+    private(set) weak var value: Value?
+    init(_ value: Value?) { self.value = value }
+}
+
 actor FakeTransport {
     var requests: [URLRequest] = []
     var streams: [AsyncThrowingStream<String, Error>.Continuation] = []
     var delays: [UInt64] = []
     var failures = 0
+    var openErrors: [TransmitError] = []
+    var sleepCancelled = false
     var denied = Set<String>()
     var openingPaused = false
     var openGate: CheckedContinuation<Void, Never>?
@@ -26,12 +33,13 @@ actor FakeTransport {
     func open(_ request: URLRequest) async throws -> EventConnection {
         requests.append(request)
         if openingPaused { await withCheckedContinuation { openGate = $0 } }
+        if !openErrors.isEmpty { throw openErrors.removeFirst() }
         if failures > 0 { failures -= 1; throw URLError(.cannotConnectToHost) }
         var sink: AsyncThrowingStream<String, Error>.Continuation!
         let stream = AsyncThrowingStream<String, Error> { sink = $0 }
         streams.append(sink)
         let index = streams.count - 1
-        return EventConnection(lines: stream, cancel: { Task { self.cancel(index) } })
+        return EventConnection(lines: stream, cancel: { Task { await self.cancel(index) } })
     }
     func cancel(_ index: Int) { cancellations += 1; streams[index].finish() }
     func send(_ request: URLRequest) throws {
@@ -42,8 +50,14 @@ actor FakeTransport {
         delays.append(delay)
         try await Task.sleep(nanoseconds: 5_000_000)
     }
-    func configure(failures: Int = 0, denied: Set<String> = [], paused: Bool = false) {
+    func configure(failures: Int = 0, denied: Set<String> = [], paused: Bool = false, errors: [TransmitError] = []) {
+        self.openErrors = errors
         self.failures = failures; self.denied = denied; self.openingPaused = paused
+    }
+    func waitForCancellation(_ delay: UInt64) async throws {
+        delays.append(delay)
+        do { try await Task.sleep(nanoseconds: 10_000_000_000) }
+        catch { sleepCancelled = true; throw error }
     }
     func releaseOpen() { openingPaused = false; openGate?.resume(); openGate = nil }
     func emit(_ line: String) { streams.last?.yield(line) }
@@ -254,4 +268,121 @@ final class ClientTests: XCTestCase {
         await idle.close()
         XCTAssertNotEqual(idle.uid, client.uid)
     }
+
+    func testConnectWithoutConsumers() async throws {
+        let fake = FakeTransport()
+        let client = try client(fake)
+        let initialState = await client.state
+        XCTAssertEqual(initialState, .idle)
+        await client.connect()
+        await client.connect()
+        try await eventually { await client.state == .connected }
+        let subscriptions = await fake.count("subscribe")
+        XCTAssertEqual(subscriptions, 0)
+        await client.close()
+        await client.connect()
+        let opens = await fake.count("events")
+        XCTAssertEqual(opens, 1)
+    }
+
+    func testRepeatedUnauthorizedAndForbiddenStopAndExposeError() async throws {
+        for status in [401, 403] {
+            let fake = FakeTransport()
+            await fake.configure(errors: Array(repeating: .httpStatus(status), count: 5))
+            let client = try client(fake)
+            let stream = await client.messages(on: "private", as: Int.self)
+            do { for try await _ in stream { XCTFail() }; XCTFail("Authentication must fail") }
+            catch { XCTAssertEqual(error as? TransmitError, .httpStatus(status)) }
+            let state = await client.state, error = await client.lastError as? TransmitError
+            XCTAssertEqual(state, .authenticationFailed)
+            XCTAssertEqual(error, .httpStatus(status))
+            await client.connect()
+            let rejected = await client.messages(on: "private", as: Int.self)
+            do { for try await _ in rejected { XCTFail() }; XCTFail() }
+            catch { XCTAssertEqual(error as? TransmitError, .httpStatus(status)) }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let opens = await fake.count("events"), delays = await fake.delays
+            XCTAssertEqual(opens, 3)
+            XCTAssertEqual(delays, [1_000_000_000, 2_000_000_000])
+
+            await fake.configure()
+            await client.refreshAuthentication()
+            let resumed = await client.messages(on: "private", as: Int.self)
+            try await eventually { await fake.count("subscribe") == 1 }
+            let recoveredError = await client.lastError
+            XCTAssertNil(recoveredError)
+            await fake.emit("data: {\"channel\":\"private\",\"payload\":42}")
+            var iterator = resumed.makeAsyncIterator()
+            let value = try await iterator.next()
+            XCTAssertEqual(value, 42)
+            await client.close()
+        }
+    }
+
+    func testAuthenticationFailuresAreConsecutiveAndResetOnSuccess() async throws {
+        let fake = FakeTransport()
+        await fake.configure(errors: [.httpStatus(401), .httpStatus(503), .httpStatus(403), .httpStatus(401)])
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        try await eventually { await fake.count("subscribe") == 1 }
+        let firstOpens = await fake.count("events")
+        XCTAssertEqual(firstOpens, 5)
+        await fake.configure(errors: [.httpStatus(403), .httpStatus(401)])
+        await fake.end()
+        try await eventually { await fake.count("subscribe") == 2 }
+        let secondOpens = await fake.count("events"), error = await client.lastError
+        XCTAssertEqual(secondOpens, 8)
+        XCTAssertNil(error)
+        await client.close()
+        _ = stream
+    }
+
+    func testDeinitReleasesClientAndConnectionWithAnActiveConsumer() async throws {
+        let fake = FakeTransport()
+        var client: TransmitClient? = try client(fake)
+        let owner = WeakReference(client)
+        let connection = WeakReference(await client?.connection)
+        let stream = await client!.messages(on: "a", as: Int.self)
+        try await eventually { await fake.count("subscribe") == 1 }
+        client = nil
+        XCTAssertNil(owner.value, "The connection loop must not retain the public client")
+        try await eventually { await fake.cancellations == 1 }
+        var iterator = stream.makeAsyncIterator()
+        let end = try await iterator.next()
+        XCTAssertNil(end)
+        try await eventually { connection.value == nil }
+        let unsubscribes = await fake.count("unsubscribe")
+        XCTAssertEqual(unsubscribes, 1)
+    }
+
+    func testDeinitCancelsBackoffAndPendingOpen() async throws {
+        let fake = FakeTransport()
+        await fake.configure(failures: 100)
+        var client: TransmitClient? = try TransmitClient(baseURL: base, transport: fake.transport,
+            sleep: { try await fake.waitForCancellation($0) })
+        let owner = WeakReference(client)
+        let connection = WeakReference(await client?.connection)
+        let stream = await client!.messages(on: "a", as: Int.self)
+        try await eventually { await fake.delays.count == 1 }
+        client = nil
+        XCTAssertNil(owner.value)
+        try await eventually { await fake.sleepCancelled }
+        try await eventually { connection.value == nil }
+
+        await fake.configure(paused: true)
+        var opening: TransmitClient? = try self.client(fake)
+        let openingOwner = WeakReference(opening)
+        let openingConnection = WeakReference(await opening?.connection)
+        let openingStream = await opening!.messages(on: "b", as: Int.self)
+        try await eventually { await fake.openGate != nil }
+        opening = nil
+        XCTAssertNil(openingOwner.value)
+        try await eventually { await openingConnection.value?.state == .closed }
+        await fake.releaseOpen()
+        try await eventually { openingConnection.value == nil }
+        let cancellations = await fake.cancellations
+        XCTAssertEqual(cancellations, 1)
+        _ = [stream, openingStream]
+    }
+
 }

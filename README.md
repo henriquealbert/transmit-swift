@@ -11,7 +11,7 @@ For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example
 Add the package in Xcode, or add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/henriquealbert/transmit-swift.git", branch: "main")
+.package(url: "https://github.com/henriquealbert/transmit-swift.git", from: "0.1.0")
 ```
 
 Add `.product(name: "Transmit", package: "transmit-swift")` to your target's dependencies.
@@ -48,9 +48,9 @@ await client.close()
 
 Each call to `messages` creates an independent consumer. Consumers on the same channel share one server subscription. Cancelling the consuming task removes that consumer; the last consumer's termination sends `POST /__transmit/unsubscribe`. `await client.unsubscribe(from: "notifications")` ends all consumers on that channel. Merely breaking a loop does not reliably terminate an async stream; cancel its task or explicitly unsubscribe.
 
-Payloads may be objects, arrays, scalars or `null` (use an optional `Decodable` type). Malformed envelopes and ping comments are ignored. A payload decoding error or failed subscription finishes the affected stream with an error. Network failures opening or reading SSE reconnect automatically. Transmit does not replay messages lost during a disconnect.
+Payloads may be objects, arrays, scalars or `null` (use an optional `Decodable` type). Malformed envelopes and ping comments are ignored. A payload decoding error or failed subscription finishes the affected stream with an error. Network failures opening or reading SSE reconnect automatically. Transmit does not replay messages lost during a disconnect. Applications should also tolerate duplicate events after reconnection/resubscription, especially when their backend implements replay or redelivery. Include a stable `seq` field in each payload and deduplicate it per channel. A server restart must not reuse sequence values within that same deduplication scope.
 
-Streams are unbounded by default. To bound a slow consumer's memory, pass `bufferingPolicy: .bufferingNewest(100)`; this intentionally drops older buffered messages. Retain the client and call `close()` explicitly to stop its connection task and release network resources.
+Streams are unbounded by default. To bound a slow consumer's memory, pass `bufferingPolicy: .bufferingNewest(100)`; this intentionally drops older buffered messages. Retain the client for the lifetime of its consumers and call `close()` explicitly for deterministic cleanup. Releasing the last client reference also schedules connection cancellation and finishes its streams; the background loop does not retain the public client. Cleanup from `deinit` is asynchronous, so await `close()` when completion matters. The SwiftUI example also calls `close()` from `onDisappear`.
 
 ## Authentication and JWT refresh
 
@@ -80,18 +80,40 @@ The async provider is invoked before every stream, subscribe and unsubscribe req
 
 If the backend requires query authentication, pass `tokenQueryParameter: "token"`. This adds the token to both GET and POST URLs, in addition to the header. Enable it only when needed because URLs can appear in proxy logs. Header authentication works without it.
 
-`refreshAuthentication()` schedules reopening of the stream with the provider's latest credentials and restores active channels. It does not wait for the new connection. Failed stream requests, including HTTP 401, retry with a new provider call. A failed subscribe request is reported to its consumers so the app can decide when to retry the channel. Configure authentication and native-client CSRF rules on the Adonis server for all three Transmit routes.
+`refreshAuthentication()` schedules reopening of the stream with the provider's latest credentials and restores active channels. It does not wait for the new connection. The provider is called again for each retry. After three consecutive HTTP 401/403 responses from the SSE GET, retries stop, `state` becomes `.authenticationFailed`, `lastError` contains the HTTP error, and active message streams finish with that error. A successful open or a different opening error resets the consecutive-authentication-failure count. After repairing credentials, call `refreshAuthentication()` and create new message consumers, or create a new client. A failed subscribe request is reported to its consumers so the app can decide when to retry the channel. Configure authentication and native-client CSRF rules on the Adonis server for all three Transmit routes.
 
 ## Connection behavior
 
-- The first consumer opens `GET {baseURL}/__transmit/events?uid=…` with `Accept: text/event-stream`.
+- `await client.connect()` starts connecting without a subscription; it returns before the stream opens. Otherwise, the first consumer opens `GET {baseURL}/__transmit/events?uid=…` with `Accept: text/event-stream`.
 - Subscriptions use JSON `{ "uid": "…", "channel": "…" }` and the official subscribe/unsubscribe endpoints.
 - Retries wait 1, 2, 4, 8, 16, then 30 seconds, capped at 30. Receiving a valid event resets the delay to one second. Explicit authentication refresh follows the same reconnect delay.
-- `await client.state` reports idle, connecting, connected, reconnecting or closed. Connected means the HTTP stream has opened; it does not acknowledge every channel's subscription.
+- `await client.state` reports idle, connecting, connected, reconnecting, authenticationFailed or closed. `await client.lastError` exposes the latest SSE opening failure and clears when a stream opens successfully. Connected means the HTTP stream has opened; it does not acknowledge every channel's subscription.
 - `close()` is permanent and idempotent. It ends consumers, cancels the reader and retry delay, and attempts unsubscription. Cleanup POST failures are best effort when offline. Create a new client to start again.
 - A base URL can include a path prefix, but cannot include credentials, a query or a fragment. Use HTTPS in production. An injected `URLSession` can supply app-specific timeout and networking configuration.
 
 The parser follows Transmit's one-JSON-envelope-per-`data:`-line protocol. It is not a general multiline SSE/EventSource implementation. The package targets Apple platforms; Foundation's streaming URLSession API is used directly.
+
+## URLSession and SSE read timeout
+
+Pass your own session to configure headers, cookies, caching and timeouts for both SSE and the subscription POSTs. A read/idle timeout around **90 seconds** is a useful starting point; set the server's ping interval comfortably below it:
+
+```swift
+let baseURL = URL(string: "https://api.example.com")!
+let configuration = URLSessionConfiguration.default
+configuration.timeoutIntervalForRequest = 90
+let session = URLSession(configuration: configuration)
+let client = try TransmitClient(
+    baseURL: baseURL,
+    session: session
+)
+
+// Once your app has finished using this client and its dedicated session:
+await client.close()
+session.invalidateAndCancel()
+```
+
+Apple defines [`timeoutIntervalForRequest`](https://developer.apple.com/documentation/foundation/urlsessionconfiguration/timeoutintervalforrequest) as the wait for additional data; receiving data resets that timer. `timeoutIntervalForResource` separately limits the whole request's duration, so setting it to 90 seconds would cap the entire SSE connection. Tune that total-duration limit separately if needed. The library leaves an injected session's configuration and lifetime under your control; it does not invalidate a shared session.
+
 
 ## Tests and coverage
 
@@ -110,7 +132,7 @@ TRANSMIT_INTEGRATION=1 swift test --enable-code-coverage
 python3 scripts/check-coverage.py
 ```
 
-CI runs the build, unit tests, real-server integration and an iOS 15 build. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
+CI runs the build, unit tests, real-server integration and an iOS 15 build. A separate Swift 6 language-mode job builds and runs the same tests with complete concurrency checking and compiler warnings treated as errors; both jobs enforce the coverage gate. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
 
 ## License
 

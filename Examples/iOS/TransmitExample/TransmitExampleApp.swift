@@ -27,15 +27,23 @@ final class FeedModel: ObservableObject {
     @Published private(set) var serverInstances: Set<String> = []
     @Published private(set) var error: String?
     let endpoint = ProcessInfo.processInfo.environment["TRANSMIT_BASE_URL"] ?? "http://127.0.0.1:3333"
+    private var client: TransmitClient?
     private let logger = Logger(subsystem: "io.elcubo.TransmitExample", category: "messages")
 
     func listen() async {
+        guard client == nil else { return }
+        error = nil
         guard let url = URL(string: endpoint) else {
             error = "Invalid server URL: \(endpoint)"
             return
         }
         do {
-            let client = try TransmitClient(baseURL: url)
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 90
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            let client = try TransmitClient(baseURL: url, session: session)
+            self.client = client
             let monitor = Task {
                 var previousStatus: String?
                 while !Task.isCancelled {
@@ -46,6 +54,9 @@ final class FeedModel: ObservableObject {
                     case .connected: status = "Connected"
                     case .reconnecting: status = "Reconnecting"
                     case .closed: status = "Closed"
+                    case .authenticationFailed:
+                        status = "Authentication failed"
+                        if let failure = await client.lastError { error = String(describing: failure) }
                     }
                     if status != previousStatus {
                         logger.info("STATE \(self.status, privacy: .public) uid=\(client.uid, privacy: .public)")
@@ -65,14 +76,23 @@ final class FeedModel: ObservableObject {
                     logger.info("RECEIVED server=\(message.serverInstance, privacy: .public) sequence=\(message.sequence) source=\(message.source, privacy: .public) text=\(message.text, privacy: .public) uid=\(client.uid, privacy: .public)")
                 }
             } catch {
-                self.error = error.localizedDescription
+                self.error = String(describing: error)
+                connected = false
+                status = await client.state == .authenticationFailed ? "Authentication failed" : "Stopped"
                 logger.error("Subscription ended: \(error.localizedDescription, privacy: .public)")
             }
             monitor.cancel()
             await client.close()
+            if self.client?.uid == client.uid { self.client = nil }
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    func close() async {
+        let current = client
+        client = nil
+        await current?.close()
     }
 }
 
@@ -149,6 +169,7 @@ struct FeedView: View {
         .foregroundColor(ink)
         .background(Color(red: 0.96, green: 0.96, blue: 0.94).ignoresSafeArea())
         .task { await model.listen() }
+        .onDisappear { Task { await model.close() } }
     }
 
     private func metric(_ title: String, value: String) -> some View {

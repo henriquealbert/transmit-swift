@@ -32,7 +32,7 @@ open Examples/iOS/TransmitExample.xcodeproj
 
 Choose the **TransmitExample** scheme, select an iPhone Simulator, and run. The project resolves the `Transmit` product from `../..`, the repository root, so changes to the library are used immediately.
 
-Within five seconds of subscribing, timer messages appear. Send a manual broadcast to see it at the top of the list. The app retains the latest 100 messages and logs each received message using the `io.elcubo.TransmitExample` subsystem. Its SwiftUI task owns the subscription and closes the client when the task ends.
+Within five seconds of subscribing, timer messages appear. Send a manual broadcast to see it at the top of the list. The app retains the latest 100 messages and logs each received message using the `io.elcubo.TransmitExample` subsystem. Its SwiftUI task owns the subscription and closes the client when the task ends; `onDisappear` also closes it explicitly. The app configures a 90-second SSE read timeout and displays terminal authentication failures.
 
 ## Build, launch and inspect from the terminal
 
