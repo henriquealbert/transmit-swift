@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+.DS_Store
+Tests/IntegrationServer/node_modules/
