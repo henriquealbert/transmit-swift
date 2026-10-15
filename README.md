@@ -4,6 +4,8 @@ A native, zero-dependency Swift client for [AdonisJS Transmit](https://docs.adon
 
 It uses `URLSession.bytes`, Swift concurrency and typed `AsyncThrowingStream` consumers. One UUID identifies a client across reconnects. Channels subscribe only after the SSE response opens, and active channels are restored after a dropped connection.
 
+For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example](Examples/README.md), including Simulator and reconnection instructions.
+
 ## Install
 
 Add the package in Xcode, or add it to `Package.swift`:

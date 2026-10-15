@@ -2,3 +2,6 @@
 .swiftpm/
 .DS_Store
 Tests/IntegrationServer/node_modules/
+Examples/Backend/node_modules/
+xcuserdata/
+*.xcuserstate
