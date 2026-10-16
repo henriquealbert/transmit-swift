@@ -7,6 +7,7 @@ public enum TransmitError: Error, Equatable, Sendable {
     case httpStatus(Int)
     case invalidContentType
     case closed
+    case notSubscribed(String)
 }
 
 struct EventConnection: Sendable {

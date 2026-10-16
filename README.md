@@ -11,7 +11,7 @@ For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example
 Add the package in Xcode, or add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/henriquealbert/transmit-swift.git", from: "0.1.0")
+.package(url: "https://github.com/henriquealbert/transmit-swift.git", from: "0.1.1")
 ```
 
 Add `.product(name: "Transmit", package: "transmit-swift")` to your target's dependencies.
@@ -29,6 +29,7 @@ struct Notification: Codable, Sendable {
 
 let client = try TransmitClient(baseURL: URL(string: "https://api.example.com")!)
 let messages = await client.messages(on: "notifications", as: Notification.self)
+try await client.awaitSubscribed("notifications")
 let listener = Task {
     do {
         for try await message in messages {
@@ -47,6 +48,10 @@ await client.close()
 ```
 
 Each call to `messages` creates an independent consumer. Consumers on the same channel share one server subscription. Cancelling the consuming task removes that consumer; the last consumer's termination sends `POST /__transmit/unsubscribe`. `await client.unsubscribe(from: "notifications")` ends all consumers on that channel. Merely breaking a loop does not reliably terminate an async stream; cancel its task or explicitly unsubscribe.
+
+`try await client.awaitSubscribed(channel)` confirms that the subscribe POST succeeded on the current SSE connection. Waiting does not create a subscription implicitly: if there is no consumer yet, it remains pending until a consumer is registered with `messages` and its subscribe POST succeeds. A confirmed active channel returns immediately, and multiple callers can wait independently. Cancelling one wait throws `CancellationError` without removing the consumer or cancelling other waits.
+
+Unsubscribing or ending the last consumer fails pending waits with `TransmitError.notSubscribed(channel)`, including a wait started before a consumer. Subscription failures are retained so even a fast failed POST is reported to a later waiter; registering a new consumer or explicitly unsubscribing clears that failure. Closing fails all pending waits with `closed`, including channels without a consumer, and terminal SSE authentication failure propagates its HTTP error to all waits. Confirmation is invalidated on disconnect or authentication refresh, so await it again before starting new work on the replacement stream. It confirms the connection at that moment; a subsequent network failure is still possible.
 
 Payloads may be objects, arrays, scalars or `null` (use an optional `Decodable` type). Malformed envelopes and ping comments are ignored. A payload decoding error or failed subscription finishes the affected stream with an error. Network failures opening or reading SSE reconnect automatically. Transmit does not replay messages lost during a disconnect. Applications should also tolerate duplicate events after reconnection/resubscription, especially when their backend implements replay or redelivery. Include a stable `seq` field in each payload and deduplicate it per channel. A server restart must not reuse sequence values within that same deduplication scope.
 
@@ -80,14 +85,14 @@ The async provider is invoked before every stream, subscribe and unsubscribe req
 
 If the backend requires query authentication, pass `tokenQueryParameter: "token"`. This adds the token to both GET and POST URLs, in addition to the header. Enable it only when needed because URLs can appear in proxy logs. Header authentication works without it.
 
-`refreshAuthentication()` schedules reopening of the stream with the provider's latest credentials and restores active channels. It does not wait for the new connection. The provider is called again for each retry. After three consecutive HTTP 401/403 responses from the SSE GET, retries stop, `state` becomes `.authenticationFailed`, `lastError` contains the HTTP error, and active message streams finish with that error. A successful open or a different opening error resets the consecutive-authentication-failure count. After repairing credentials, call `refreshAuthentication()` and create new message consumers, or create a new client. A failed subscribe request is reported to its consumers so the app can decide when to retry the channel. Configure authentication and native-client CSRF rules on the Adonis server for all three Transmit routes.
+`refreshAuthentication()` schedules immediate reopening of a connected stream with the provider's latest credentials and restores active channels. It does not wait for the new connection. The provider is called again for each retry. After three consecutive HTTP 401/403 responses from the SSE GET, retries stop, `state` becomes `.authenticationFailed`, `lastError` contains the HTTP error, and active message streams finish with that error. A successful open or a different opening error resets the consecutive-authentication-failure count. After repairing credentials, call `refreshAuthentication()` and create new message consumers, or create a new client. A failed subscribe request is reported to its consumers so the app can decide when to retry the channel. Configure authentication and native-client CSRF rules on the Adonis server for all three Transmit routes.
 
 ## Connection behavior
 
 - `await client.connect()` starts connecting without a subscription; it returns before the stream opens. Otherwise, the first consumer opens `GET {baseURL}/__transmit/events?uid=…` with `Accept: text/event-stream`.
 - Subscriptions use JSON `{ "uid": "…", "channel": "…" }` and the official subscribe/unsubscribe endpoints.
-- Retries wait 1, 2, 4, 8, 16, then 30 seconds, capped at 30. Receiving a valid event resets the delay to one second. Explicit authentication refresh follows the same reconnect delay.
-- `await client.state` reports idle, connecting, connected, reconnecting, authenticationFailed or closed. `await client.lastError` exposes the latest SSE opening failure and clears when a stream opens successfully. Connected means the HTTP stream has opened; it does not acknowledge every channel's subscription.
+- Retries wait 1, 2, 4, 8, 16, then 30 seconds, capped at 30. Opening the SSE stream resets the delay to one second, even before any event arrives. Explicit authentication refresh while connected reopens immediately without a backoff delay.
+- `await client.state` reports idle, connecting, connected, reconnecting, authenticationFailed or closed. `await client.lastError` exposes the latest SSE opening failure and clears when a stream opens successfully. Connected means the HTTP stream has opened; use `awaitSubscribed(channel)` to confirm a specific channel.
 - `close()` is permanent and idempotent. It ends consumers, cancels the reader and retry delay, and attempts unsubscription. Cleanup POST failures are best effort when offline. Create a new client to start again.
 - A base URL can include a path prefix, but cannot include credentials, a query or a fragment. Use HTTPS in production. An injected `URLSession` can supply app-specific timeout and networking configuration.
 

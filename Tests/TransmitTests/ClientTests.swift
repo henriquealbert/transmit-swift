@@ -26,6 +26,11 @@ actor FakeTransport {
     var openingPaused = false
     var openGate: CheckedContinuation<Void, Never>?
     var cancellations = 0
+    var subscribePaused = false
+    var delayedAction: String?
+    var postDelayStarted = false
+    var postDelayCancelled = false
+    var subscribeGate: CheckedContinuation<Void, Error>?
 
     nonisolated var transport: Transport {
         Transport(open: { try await self.open($0) }, send: { try await self.send($0) })
@@ -42,8 +47,17 @@ actor FakeTransport {
         return EventConnection(lines: stream, cancel: { Task { await self.cancel(index) } })
     }
     func cancel(_ index: Int) { cancellations += 1; streams[index].finish() }
-    func send(_ request: URLRequest) throws {
+    func send(_ request: URLRequest) async throws {
         requests.append(request)
+        if request.url?.lastPathComponent == delayedAction {
+            delayedAction = nil
+            postDelayStarted = true
+            do { try await Task.sleep(nanoseconds: 10_000_000_000) }
+            catch { postDelayCancelled = true; throw error }
+        }
+        if subscribePaused && request.url?.lastPathComponent == "subscribe" {
+            try await withCheckedThrowingContinuation { subscribeGate = $0 }
+        }
         if denied.contains(body(request)["channel"] ?? "") { throw TransmitError.httpStatus(403) }
     }
     func sleep(_ delay: UInt64) async throws {
@@ -58,6 +72,15 @@ actor FakeTransport {
         delays.append(delay)
         do { try await Task.sleep(nanoseconds: 10_000_000_000) }
         catch { sleepCancelled = true; throw error }
+    }
+    func delayPostOnce(_ action: String) { delayedAction = action }
+    func pauseSubscribe() { subscribePaused = true }
+    func releaseSubscribe(keepPaused: Bool = false, error: Error? = nil) {
+        subscribePaused = keepPaused
+        let gate = subscribeGate
+        subscribeGate = nil
+        if let error = error { gate?.resume(throwing: error) }
+        else { gate?.resume() }
     }
     func releaseOpen() { openingPaused = false; openGate?.resume(); openGate = nil }
     func emit(_ line: String) { streams.last?.yield(line) }
@@ -170,7 +193,7 @@ final class ClientTests: XCTestCase {
         await client.close()
     }
 
-    func testBackoffGrowsAndCapsAndResetsAfterMessage() async throws {
+    func testBackoffGrowsAndCapsAndResetsOnOpenWithoutMessages() async throws {
         let fake = FakeTransport()
         await fake.configure(failures: 7)
         let client = try client(fake)
@@ -178,15 +201,16 @@ final class ClientTests: XCTestCase {
         try await eventually { await fake.count("subscribe") == 1 }
         let delays = await fake.delays
         XCTAssertEqual(delays, [1, 2, 4, 8, 16, 30, 30].map { UInt64($0) * 1_000_000_000 })
-        await fake.emit("data: {\"channel\":\"a\",\"payload\":true}")
-        var iterator = stream.makeAsyncIterator()
-        let value = try await iterator.next()
-        XCTAssertEqual(value, true)
         await fake.end()
         try await eventually { await fake.count("subscribe") == 2 }
         let reset = await fake.delays.last
         XCTAssertEqual(reset, 1_000_000_000)
+        await fake.end()
+        try await eventually { await fake.count("subscribe") == 3 }
+        let secondReset = await fake.delays.last
+        XCTAssertEqual(secondReset, 1_000_000_000)
         await client.close()
+        _ = stream
     }
 
     func testOnlyActiveChannelsSubscribeAndReconnect() async throws {
@@ -383,6 +407,307 @@ final class ClientTests: XCTestCase {
         let cancellations = await fake.cancellations
         XCTAssertEqual(cancellations, 1)
         _ = [stream, openingStream]
+    }
+
+    func testConnectedAuthenticationRefreshDoesNotSleep() async throws {
+        let fake = FakeTransport()
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        try await eventually { await fake.count("subscribe") == 1 }
+        await client.refreshAuthentication()
+        try await eventually { await fake.count("subscribe") == 2 }
+        let delays = await fake.delays
+        XCTAssertTrue(delays.isEmpty, "Explicit refresh must not enter the backoff clock")
+        await client.close()
+        let requests = await fake.requests
+        for request in requests {
+            if request.httpMethod == "POST" {
+                XCTAssertNil(request.value(forHTTPHeaderField: "Accept"))
+            } else {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream")
+            }
+        }
+        _ = stream
+    }
+
+    func testDeinitCancelsAConnectionWithoutConsumers() async throws {
+        let fake = FakeTransport()
+        var client: TransmitClient? = try client(fake)
+        let owner = WeakReference(client)
+        let connection = WeakReference(await client?.connection)
+        await client!.connect()
+        try await eventually { await connection.value?.state == .connected }
+        client = nil
+        XCTAssertNil(owner.value)
+        try await eventually { await fake.cancellations == 1 }
+        try await eventually { connection.value == nil }
+        let subscriptions = await fake.count("subscribe")
+        XCTAssertEqual(subscriptions, 0)
+    }
+
+    func testRefreshDiscardsAnOldSubscriptionResponse() async throws {
+        for failedResponse in [false, true] {
+            let fake = FakeTransport()
+            await fake.pauseSubscribe()
+            let client = try client(fake)
+            let stream = await client.messages(on: "a", as: Int.self)
+            try await eventually { await fake.subscribeGate != nil }
+            await client.refreshAuthentication()
+            let connection = await client.connection
+            let ready = Task { try await client.awaitSubscribed("a") }
+            try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+            await fake.releaseSubscribe(keepPaused: true, error: failedResponse ? TransmitError.httpStatus(401) : nil)
+            try await eventually {
+                let count = await fake.count("subscribe"), waiting = await fake.subscribeGate != nil
+                return count == 2 && waiting
+            }
+            let opens = await fake.count("events")
+            XCTAssertEqual(opens, 2)
+            let pending = await connection.subscriptionWaiters["a"]?.count
+            XCTAssertEqual(pending, 1, "Only the current stream may confirm a subscription")
+            await fake.releaseSubscribe()
+            try await ready.value
+            await fake.emit("data: {\"channel\":\"a\",\"payload\":42}")
+            var iterator = stream.makeAsyncIterator()
+            let value = try await iterator.next()
+            XCTAssertEqual(value, 42, "A stale response must not finish the new subscription")
+            let delays = await fake.delays
+            XCTAssertTrue(delays.isEmpty)
+            await client.close()
+        }
+    }
+
+    func testAwaitSubscribedWaitsForAcknowledgementAndSharesWaiters() async throws {
+        let fake = FakeTransport()
+        await fake.pauseSubscribe()
+        let client = try client(fake)
+        let connection = await client.connection
+        let beforeConsumer = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+        let before = await fake.requests.count
+        XCTAssertEqual(before, 0, "Waiting must not create a subscription")
+        let stream = await client.messages(on: "a", as: Int.self)
+        try await eventually { await fake.subscribeGate != nil }
+        let first = Task { try await client.awaitSubscribed("a") }
+        let second = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 3 }
+        await fake.releaseSubscribe()
+        try await beforeConsumer.value
+        try await first.value
+        try await second.value
+        try await client.awaitSubscribed("a")
+        let anotherConsumer = await client.messages(on: "a", as: Int.self)
+        let requests = await fake.count("subscribe")
+        XCTAssertEqual(requests, 1)
+
+        await fake.pauseSubscribe()
+        await fake.end()
+        try await eventually { await fake.subscribeGate != nil }
+        let restored = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+        await fake.releaseSubscribe()
+        try await restored.value
+        await client.close()
+        do { try await client.awaitSubscribed("a"); XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .closed) }
+        _ = [stream, anotherConsumer]
+    }
+
+    func testAwaitSubscribedRetainsFailureAndClearsItOnNewConsumer() async throws {
+        let fake = FakeTransport()
+        await fake.pauseSubscribe()
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        let connection = await client.connection
+        let pending = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+        try await eventually { await fake.subscribeGate != nil }
+        await fake.releaseSubscribe(error: TransmitError.httpStatus(403))
+        do { try await pending.value; XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(403)) }
+        do { try await client.awaitSubscribed("a"); XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(403)) }
+        let resumed = await client.messages(on: "a", as: Int.self)
+        try await client.awaitSubscribed("a")
+        await client.unsubscribe(from: "a")
+        let nextConsumer = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+        await client.unsubscribe(from: "a")
+        do { try await nextConsumer.value; XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .notSubscribed("a")) }
+        await client.close()
+        _ = [stream, resumed]
+    }
+
+    func testCancellingAwaitSubscribedDoesNotCancelTheChannel() async throws {
+        let fake = FakeTransport()
+        await fake.pauseSubscribe()
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        let connection = await client.connection
+        let first = Task { try await client.awaitSubscribed("a") }
+        let second = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 2 }
+        first.cancel()
+        do { try await first.value; XCTFail() }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let remaining = await connection.subscriptionWaiters["a"]?.count
+        XCTAssertEqual(remaining, 1)
+        second.cancel()
+        do { try await second.value; XCTFail() }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let pending = await connection.subscriptionWaiters["a"]
+        XCTAssertNil(pending)
+        try await eventually { await fake.subscribeGate != nil }
+        await fake.releaseSubscribe()
+        try await client.awaitSubscribed("a")
+        let cancelledBeforeWaiting = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await client.awaitSubscribed("a")
+        }
+        do { try await cancelledBeforeWaiting.value; XCTFail() }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let unsubscribes = await fake.count("unsubscribe")
+        XCTAssertEqual(unsubscribes, 0)
+        await fake.emit("data: {\"channel\":\"a\",\"payload\":42}")
+        var iterator = stream.makeAsyncIterator()
+        let value = try await iterator.next()
+        XCTAssertEqual(value, 42)
+        await client.close()
+    }
+
+    func testPendingWaitersFailOnUnsubscribeConsumerEndAndClose() async throws {
+        for termination in ["unsubscribe", "consumer", "close"] {
+            let fake = FakeTransport()
+            await fake.pauseSubscribe()
+            let client = try client(fake)
+            let stream = await client.messages(on: "a", as: Int.self)
+            let consumer = Task { for try await _ in stream {} }
+            let connection = await client.connection
+            let waiting = Task { try await client.awaitSubscribed("a") }
+            try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+            try await eventually { await fake.subscribeGate != nil }
+            var closing: Task<Void, Never>?
+            switch termination {
+            case "unsubscribe": await client.unsubscribe(from: "a")
+            case "consumer": consumer.cancel(); _ = await consumer.result
+            default: closing = Task { await client.close() }
+            }
+            do { try await waiting.value; XCTFail() }
+            catch {
+                XCTAssertEqual(error as? TransmitError, termination == "close" ? .closed : .notSubscribed("a"))
+            }
+            await fake.releaseSubscribe()
+            await closing?.value
+            try await eventually { await fake.count("unsubscribe") == 1 }
+            await client.close()
+            consumer.cancel()
+            _ = await consumer.result
+        }
+    }
+
+    func testAwaitSubscribedReportsTerminalAuthenticationFailure() async throws {
+        let fake = FakeTransport()
+        await fake.configure(errors: [.httpStatus(401), .httpStatus(403), .httpStatus(401)])
+        let client = try client(fake)
+        let connection = await client.connection
+        let withoutConsumer = Task { try await client.awaitSubscribed("later") }
+        try await eventually { await connection.subscriptionWaiters["later"]?.count == 1 }
+        let stream = await client.messages(on: "a", as: Int.self)
+        do { try await client.awaitSubscribed("a"); XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
+        do { try await withoutConsumer.value; XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
+        do { try await client.awaitSubscribed("new-channel"); XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
+        await client.close()
+        _ = stream
+    }
+
+    func testCloseFailsWaitersWithoutAConsumer() async throws {
+        let fake = FakeTransport()
+        let client = try client(fake)
+        let connection = await client.connection
+        let waiting = Task { try await client.awaitSubscribed("future") }
+        try await eventually { await connection.subscriptionWaiters["future"]?.count == 1 }
+        await client.close()
+        do { try await waiting.value; XCTFail() }
+        catch { XCTAssertEqual(error as? TransmitError, .closed) }
+        let requests = await fake.requests.count
+        XCTAssertEqual(requests, 0)
+    }
+
+    func testWaitWithoutConsumerIgnoresAnOldSubscribeAcknowledgement() async throws {
+        let fake = FakeTransport()
+        await fake.pauseSubscribe()
+        let client = try client(fake)
+        let oldStream = await client.messages(on: "a", as: Int.self)
+        let connection = await client.connection
+        try await eventually { await fake.subscribeGate != nil }
+        await client.unsubscribe(from: "a")
+        let waiting = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await connection.subscriptionWaiters["a"]?.count == 1 }
+        await fake.releaseSubscribe(keepPaused: true)
+        try await eventually { await fake.count("unsubscribe") == 1 }
+        let pending = await connection.subscriptionWaiters["a"]?.count
+        XCTAssertEqual(pending, 1, "An acknowledgement without an active consumer must not complete the wait")
+        let newStream = await client.messages(on: "a", as: Int.self)
+        try await eventually { await fake.subscribeGate != nil }
+        await fake.releaseSubscribe()
+        try await waiting.value
+        await client.close()
+        _ = [oldStream, newStream]
+    }
+
+    func testRefreshImmediatelyCancelsAnInFlightSubscribe() async throws {
+        let fake = FakeTransport()
+        await fake.delayPostOnce("subscribe")
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        let ready = Task { try await client.awaitSubscribed("a") }
+        try await eventually { await fake.postDelayStarted }
+        await client.refreshAuthentication()
+        try await eventually { await fake.postDelayCancelled }
+        try await eventually { await fake.count("subscribe") == 2 }
+        try await ready.value
+        let delays = await fake.delays
+        XCTAssertTrue(delays.isEmpty)
+        await client.close()
+        _ = stream
+    }
+
+    func testDeinitCancelsAnInFlightSubscribe() async throws {
+        let fake = FakeTransport()
+        await fake.delayPostOnce("subscribe")
+        var client: TransmitClient? = try client(fake)
+        let owner = WeakReference(client)
+        let connection = WeakReference(await client?.connection)
+        let stream = await client!.messages(on: "a", as: Int.self)
+        try await eventually { await fake.postDelayStarted }
+        client = nil
+        XCTAssertNil(owner.value)
+        try await eventually { await fake.postDelayCancelled }
+        try await eventually { connection.value == nil }
+        var iterator = stream.makeAsyncIterator()
+        let end = try await iterator.next()
+        XCTAssertNil(end)
+    }
+
+    func testRefreshImmediatelyCancelsAnInFlightUnsubscribe() async throws {
+        let fake = FakeTransport()
+        let client = try client(fake)
+        let stream = await client.messages(on: "a", as: Int.self)
+        try await client.awaitSubscribed("a")
+        await fake.delayPostOnce("unsubscribe")
+        await client.unsubscribe(from: "a")
+        try await eventually { await fake.postDelayStarted }
+        await client.refreshAuthentication()
+        try await eventually { await fake.postDelayCancelled }
+        try await eventually { await fake.count("events") == 2 }
+        let delays = await fake.delays
+        XCTAssertTrue(delays.isEmpty)
+        await client.close()
+        _ = stream
     }
 
 }

@@ -36,7 +36,7 @@ router.use([() => Promise.resolve({ default: class {
   async handle(ctx, next) {
     if (ctx.request.url().startsWith('/__transmit/')) {
       history.push({ path: ctx.request.url(), authorization: ctx.request.header('authorization') ?? null,
-        query: ctx.request.qs(), body: ctx.request.body(), sessionHeader: ctx.request.header('x-transmit-session') ?? null })
+        query: ctx.request.qs(), body: ctx.request.body(), accept: ctx.request.header('accept') ?? null, sessionHeader: ctx.request.header('x-transmit-session') ?? null })
       if (ctx.request.header('authorization') !== `Bearer ${requiredToken}`) return ctx.response.unauthorized()
       if (rejectNext) { rejectNext = false; return ctx.response.serviceUnavailable() }
       if (invalidContent) { invalidContent = false; return ctx.response.send('not SSE') }

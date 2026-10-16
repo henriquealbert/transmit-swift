@@ -70,6 +70,12 @@ public actor TransmitClient {
         return stream
     }
 
+    /// Waits for a consumer and the current stream's successful subscribe POST.
+    /// Cancelling this wait leaves the message consumer and other waiters active.
+    public func awaitSubscribed(_ channel: String) async throws {
+        try await connection.awaitSubscribed(channel)
+    }
+
     /// Reopens with fresh credentials. After authenticationFailed, register new consumers.
     public func refreshAuthentication() async { await connection.refreshAuthentication() }
 
@@ -93,7 +99,12 @@ actor TransmitConnection {
     private let commands: AsyncStream<Command>
     private let commandSink: AsyncStream<Command>.Continuation
     private var worker: Task<Void, Never>?
+    private var subscriptionRequest: Task<Void, Error>?
     private var channels: [String: [UUID: Sink]] = [:]
+    private var subscribed: Set<String> = []
+    private var streamGeneration = UUID()
+    private var subscriptionErrors: [String: Error] = [:]
+    private(set) var subscriptionWaiters: [String: [UUID: CheckedContinuation<Void, Error>]] = [:]
 
     private enum Command: Sendable {
         case reconcile(String), line(UUID, String), ended(UUID), reconnect
@@ -137,9 +148,56 @@ actor TransmitConnection {
             sink.finish(lastError)
             return
         }
+        subscriptionErrors[channel] = nil
         channels[channel, default: [:]][id] = sink
+        if state == .connected && subscribed.contains(channel) {
+            resolveSubscriptionWaiters(channel: channel, error: nil)
+        }
         commandSink.yield(.reconcile(channel))
         start()
+    }
+
+    func awaitSubscribed(_ channel: String) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    waiter.resume(throwing: CancellationError())
+                } else if state == .closed {
+                    waiter.resume(throwing: TransmitError.closed)
+                } else if state == .authenticationFailed, let error = lastError {
+                    waiter.resume(throwing: error)
+                } else if let error = subscriptionErrors[channel] {
+                    waiter.resume(throwing: error)
+                } else if channels[channel] != nil && state == .connected && subscribed.contains(channel) {
+                    waiter.resume()
+                } else {
+                    subscriptionWaiters[channel, default: [:]][id] = waiter
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelSubscriptionWaiter(channel: channel, id: id) }
+        }
+    }
+
+    private func cancelSubscriptionWaiter(channel: String, id: UUID) {
+        let waiter = subscriptionWaiters[channel]?.removeValue(forKey: id)
+        if subscriptionWaiters[channel]?.isEmpty == true { subscriptionWaiters[channel] = nil }
+        waiter?.resume(throwing: CancellationError())
+    }
+
+    private func resolveSubscriptionWaiters(channel: String, error: Error?) {
+        let waiters = subscriptionWaiters.removeValue(forKey: channel)
+        for waiter in waiters?.values ?? [:].values {
+            if let error = error { waiter.resume(throwing: error) }
+            else { waiter.resume() }
+        }
+    }
+
+    private func resolveAllSubscriptionWaiters(error: Error) {
+        for channel in Array(subscriptionWaiters.keys) {
+            resolveSubscriptionWaiters(channel: channel, error: error)
+        }
     }
 
     func refreshAuthentication() {
@@ -148,6 +206,12 @@ actor TransmitConnection {
             lastError = nil
             start()
         } else {
+            if state == .connected {
+                state = .reconnecting
+                subscribed.removeAll()
+                streamGeneration = UUID()
+                subscriptionRequest?.cancel()
+            }
             commandSink.yield(.reconnect)
         }
     }
@@ -160,9 +224,14 @@ actor TransmitConnection {
     func close() async {
         guard state != .closed else { return }
         state = .closed
+        streamGeneration = UUID()
+        subscribed.removeAll()
         let active = Array(channels.keys)
         for channel in active { finish(channel: channel, error: nil) }
+        subscriptionErrors.removeAll()
+        resolveAllSubscriptionWaiters(error: TransmitError.closed)
         worker?.cancel()
+        subscriptionRequest?.cancel()
         commandSink.finish()
         await worker?.value
         for channel in active { try? await post("unsubscribe", channel: channel) }
@@ -173,12 +242,17 @@ actor TransmitConnection {
         channels[channel]?[id] = nil
         if channels[channel]?.isEmpty == true {
             channels[channel] = nil
+            subscriptionErrors[channel] = nil
+            resolveSubscriptionWaiters(channel: channel, error: TransmitError.notSubscribed(channel))
             commandSink.yield(.reconcile(channel))
         }
     }
 
     private func finish(channel: String, error: Error?) {
         let sinks = channels.removeValue(forKey: channel)
+        subscriptionErrors[channel] = error
+        let waiterError = error ?? (state == .closed ? TransmitError.closed : TransmitError.notSubscribed(channel))
+        resolveSubscriptionWaiters(channel: channel, error: waiterError)
         for sink in sinks?.values ?? [:].values { sink.finish(error) }
     }
 
@@ -193,12 +267,13 @@ actor TransmitConnection {
         }
         components.queryItems = query.isEmpty ? nil : query
         var request = URLRequest(url: components.url!)
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         if let token = token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let channel = channel {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONEncoder().encode(["uid": uid, "channel": channel])
+        } else {
+            request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         }
         return request
     }
@@ -207,16 +282,28 @@ actor TransmitConnection {
         try await transport.send(request(action, channel: channel))
     }
 
-    private func reconcile(_ channel: String, subscribed: inout Set<String>) async {
+    private func reconcilePost(_ action: String, channel: String) async throws {
+        let request = Task { try await post(action, channel: channel) }
+        subscriptionRequest = request
+        defer { subscriptionRequest = nil }
+        try await request.value
+    }
+
+    private func reconcile(_ channel: String) async {
+        guard state == .connected else { return }
         if channels[channel] != nil && !subscribed.contains(channel) {
+            let generation = streamGeneration
             do {
-                try await post("subscribe", channel: channel)
+                try await reconcilePost("subscribe", channel: channel)
+                guard generation == streamGeneration else { return }
                 subscribed.insert(channel)
+                if channels[channel] != nil { resolveSubscriptionWaiters(channel: channel, error: nil) }
             } catch {
+                guard generation == streamGeneration else { return }
                 finish(channel: channel, error: error)
             }
         } else if channels[channel] == nil && subscribed.remove(channel) != nil {
-            try? await post("unsubscribe", channel: channel)
+            try? await reconcilePost("unsubscribe", channel: channel)
         }
     }
 
@@ -226,35 +313,37 @@ actor TransmitConnection {
         var iterator = commands.makeAsyncIterator()
         while !Task.isCancelled {
             state = state == .idle ? .connecting : .reconnecting
+            var reconnectImmediately = false
             do {
                 let connection = try await transport.open(request("events"))
                 let generation = UUID()
+                streamGeneration = generation
                 let reader = Task {
                     do {
                         for try await line in connection.lines { commandSink.yield(.line(generation, line)) }
                     } catch { /* EOF and network errors both reconnect. */ }
                     commandSink.yield(.ended(generation))
                 }
-                defer { reader.cancel(); connection.cancel() }
+                defer { reader.cancel(); connection.cancel(); subscribed.removeAll() }
                 try Task.checkCancellation()
+                delay = 1_000_000_000
                 authenticationFailures = 0
                 lastError = nil
                 state = .connected
-                var subscribed: Set<String> = []
-                for channel in Array(channels.keys) { await reconcile(channel, subscribed: &subscribed) }
+                for channel in Array(channels.keys) { await reconcile(channel) }
                 connectionLoop: while let command = await iterator.next() {
                     switch command {
                     case .reconcile(let channel):
-                        await reconcile(channel, subscribed: &subscribed)
+                        await reconcile(channel)
                     case .line(let source, let line):
-                        if source == generation, let event = SSEParser.parse(line) {
-                            delay = 1_000_000_000
+                        if source == streamGeneration, let event = SSEParser.parse(line) {
                             for sink in channels[event.channel]?.values ?? [:].values { sink.receive(event.payload) }
                         }
                     case .reconnect:
+                        reconnectImmediately = true
                         break connectionLoop
                     case .ended(let source):
-                        if source == generation { break connectionLoop }
+                        if source == streamGeneration { break connectionLoop }
                     }
                 }
             } catch {
@@ -267,11 +356,13 @@ actor TransmitConnection {
                 if authenticationFailures == 3 {
                     state = .authenticationFailed
                     for channel in Array(channels.keys) { finish(channel: channel, error: error) }
+                    resolveAllSubscriptionWaiters(error: error)
                     break
                 }
             }
             if Task.isCancelled { break }
             state = .reconnecting
+            if reconnectImmediately { continue }
             do { try await sleep(delay) } catch { break }
             delay = min(delay * 2, 30_000_000_000)
         }
