@@ -2,6 +2,15 @@ import XCTest
 @testable import Transmit
 
 final class IntegrationTests: XCTestCase {
+    private struct RequestRecord: Decodable {
+        let path: String
+        let authorization: String?
+        let query: [String: String]
+        let body: [String: String]
+        let sessionHeader: String?
+        var uid: String? { body["uid"] ?? query["uid"] }
+    }
+
     func testRealAdonisServer() async throws {
         guard ProcessInfo.processInfo.environment["TRANSMIT_INTEGRATION"] == "1" else {
             throw XCTSkip("Run TRANSMIT_INTEGRATION=1 swift test after npm ci --prefix Tests/IntegrationServer")
@@ -32,16 +41,14 @@ final class IntegrationTests: XCTestCase {
             XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
             return data
         }
-        func history() async throws -> [[String: Any]] {
+        func history() async throws -> [RequestRecord] {
             let data = try await call("history")
-            return try JSONSerialization.jsonObject(with: data) as! [[String: Any]]
+            return try JSONDecoder().decode([RequestRecord].self, from: data)
         }
         func count(_ path: String, uid: String? = nil) async throws -> Int {
             let rows = try await history()
             return rows.filter { row in
-                guard (row["path"] as? String)?.hasSuffix(path) == true else { return false }
-                let identifier = ((row["body"] as? [String: Any])?["uid"] ?? (row["query"] as? [String: Any])?["uid"]) as? String
-                return uid == nil || identifier == uid
+                row.path.hasSuffix(path) && (uid == nil || row.uid == uid)
             }.count
         }
 
@@ -100,17 +107,14 @@ final class IntegrationTests: XCTestCase {
         _ = await consumer.result
         try await eventually { try await count("unsubscribe", uid: client.uid) == 1 }
         let recordedHistory = try await history()
-        let rows = recordedHistory.filter { row in
-            let body = row["body"] as? [String: Any], query = row["query"] as? [String: Any]
-            return body?["uid"] as? String == client.uid || query?["uid"] as? String == client.uid
-        }
+        let rows = recordedHistory.filter { $0.uid == client.uid }
         XCTAssertGreaterThan(rows.count, 6)
         for row in rows {
-            XCTAssertEqual(row["sessionHeader"] as? String, "custom")
-            let token = (row["query"] as? [String: Any])?["token"] as? String
-            XCTAssertEqual(row["authorization"] as? String, "Bearer \(token!)")
+            XCTAssertEqual(row.sessionHeader, "custom")
+            let token = try XCTUnwrap(row.query["token"])
+            XCTAssertEqual(row.authorization, "Bearer \(token)")
         }
-        XCTAssertEqual(rows.last?["authorization"] as? String, "Bearer second")
+        XCTAssertEqual(rows.last?.authorization, "Bearer second")
         await client.close()
 
         // A persistently rejected real GET must stop instead of retrying forever.
