@@ -24,17 +24,17 @@ await app.boot()
 const server = await app.container.make('server')
 const router = await app.container.make('router')
 const transmit = await app.container.make('transmit')
-const channel = 'demo/messages'
+const channel = 'chats/general'
 const serverInstance = randomUUID().slice(0, 8)
-let sequence = 0
+let seq = 0
 server.use([() => import('@adonisjs/core/bodyparser_middleware')])
 transmit.registerRoutes()
 transmit.on('subscribe', ({ uid, channel }) => console.log(`SUBSCRIBED uid=${uid} channel=${channel} server=${serverInstance}`))
 
 function publish(text, source) {
-  const message = { id: randomUUID(), text, source, serverInstance, sequence: ++sequence, sentAt: new Date().toISOString() }
+  const message = { id: randomUUID(), text, source, serverInstance, seq: ++seq, sentAt: new Date().toISOString() }
   transmit.broadcast(channel, message)
-  console.log(`PUBLISHED server=${serverInstance} sequence=${sequence} source=${source} text=${text}`)
+  console.log(`PUBLISHED server=${serverInstance} seq=${seq} source=${source} text=${text}`)
   return message
 }
 router.get('/health', () => ({ ok: true, channel, serverInstance }))

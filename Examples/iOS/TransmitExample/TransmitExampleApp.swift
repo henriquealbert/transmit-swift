@@ -9,18 +9,18 @@ struct TransmitExampleApp: App {
     }
 }
 
-struct DemoMessage: Decodable, Identifiable, Sendable {
+struct ChatMessage: Decodable, Identifiable, Sendable {
     let id: String
     let text: String
     let source: String
     let serverInstance: String
-    let sequence: Int
+    let seq: Int
     let sentAt: String
 }
 
 @MainActor
 final class FeedModel: ObservableObject {
-    @Published private(set) var messages: [DemoMessage] = []
+    @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var status = "Connecting"
     @Published private(set) var connected = false
     @Published private(set) var totalReceived = 0
@@ -28,6 +28,7 @@ final class FeedModel: ObservableObject {
     @Published private(set) var error: String?
     let endpoint = ProcessInfo.processInfo.environment["TRANSMIT_BASE_URL"] ?? "http://127.0.0.1:3333"
     private var client: TransmitClient?
+    private var seenSequences: [String: Int] = [:]
     private let logger = Logger(subsystem: "io.elcubo.TransmitExample", category: "messages")
 
     func listen() async {
@@ -67,13 +68,27 @@ final class FeedModel: ObservableObject {
                 }
             }
             do {
-                let stream = await client.messages(on: "demo/messages", as: DemoMessage.self)
+                let stream = await client.messages(on: "chats/general", as: ChatMessage.self)
+                try await client.awaitSubscribed("chats/general")
+                var request = URLRequest(url: url.appendingPathComponent("broadcast"))
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONEncoder().encode(["text": "Hello from the SwiftUI client"])
+                let (_, response) = try await session.data(for: request)
+                guard let response = response as? HTTPURLResponse else { throw TransmitError.invalidResponse }
+                guard (200..<300).contains(response.statusCode) else {
+                    throw TransmitError.httpStatus(response.statusCode)
+                }
+                logger.info("PUBLISHED after subscription confirmation uid=\(client.uid, privacy: .public)")
                 for try await message in stream {
+                    // This channel delivers increasing sequence values per server instance.
+                    guard message.seq > seenSequences[message.serverInstance, default: 0] else { continue }
+                    seenSequences[message.serverInstance] = message.seq
                     messages.insert(message, at: 0)
                     if messages.count > 100 { messages.removeLast() }
                     totalReceived += 1
                     serverInstances.insert(message.serverInstance)
-                    logger.info("RECEIVED server=\(message.serverInstance, privacy: .public) sequence=\(message.sequence) source=\(message.source, privacy: .public) text=\(message.text, privacy: .public) uid=\(client.uid, privacy: .public)")
+                    logger.info("RECEIVED server=\(message.serverInstance, privacy: .public) seq=\(message.seq) source=\(message.source, privacy: .public) text=\(message.text, privacy: .public) uid=\(client.uid, privacy: .public)")
                 }
             } catch {
                 self.error = String(describing: error)
@@ -82,6 +97,7 @@ final class FeedModel: ObservableObject {
                 logger.error("Subscription ended: \(error.localizedDescription, privacy: .public)")
             }
             monitor.cancel()
+            await client.unsubscribe(from: "chats/general")
             await client.close()
             if self.client?.uid == client.uid { self.client = nil }
         } catch {
@@ -92,6 +108,7 @@ final class FeedModel: ObservableObject {
     func close() async {
         let current = client
         client = nil
+        await current?.unsubscribe(from: "chats/general")
         await current?.close()
     }
 }
@@ -113,7 +130,7 @@ struct FeedView: View {
                         Text(model.status).font(.caption.weight(.semibold))
                     }
                 }
-                Text("Live messages")
+                Text("Live chat")
                     .font(.system(size: 38, weight: .bold, design: .rounded))
                 Text("AdonisJS → your iPhone\nA live feed, delivered over SSE.")
                     .font(.subheadline).foregroundColor(.secondary)
@@ -127,7 +144,7 @@ struct FeedView: View {
                 .background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 20))
 
                 HStack {
-                    Text("demo/messages").font(.system(.subheadline, design: .monospaced).weight(.semibold))
+                    Text("chats/general").font(.system(.subheadline, design: .monospaced).weight(.semibold))
                     Spacer()
                     Text("NEWEST FIRST").font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
                 }
@@ -148,7 +165,7 @@ struct FeedView: View {
                                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                                     .foregroundColor(accent)
                                 Spacer()
-                                Text("#\(message.sequence)").font(.caption.monospacedDigit()).foregroundColor(.secondary)
+                                Text("#\(message.seq)").font(.caption.monospacedDigit()).foregroundColor(.secondary)
                             }
                             Text(message.text).font(.system(size: 19, weight: .semibold))
                             HStack {

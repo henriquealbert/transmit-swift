@@ -1,6 +1,6 @@
 # AdonisJS → SwiftUI example
 
-A runnable backend and iOS app that use the local `transmit-swift` package. The backend publishes on `demo/messages` every five seconds and accepts manual messages through `POST /broadcast`. The app lists received messages, connection status and the number of server instances it has seen.
+A runnable backend and iOS app that use the local `transmit-swift` package. The backend publishes on `chats/general` every five seconds and accepts manual messages through `POST /broadcast`. The app confirms its subscription with `awaitSubscribed`, publishes a greeting through that endpoint, and lists received chat messages, connection status and the number of server instances it has seen.
 
 Requirements: Node.js 24, Xcode 16 or later, and an installed iOS Simulator runtime. The app's deployment target is iOS 15. Run the commands below from the repository root. The Xcode project is included; no project generator is needed.
 
@@ -20,7 +20,7 @@ curl -X POST http://127.0.0.1:3333/broadcast \
   -d '{"text":"Hello from Adonis"}'
 ```
 
-Messages contain `id`, `text`, `source`, `serverInstance`, `sequence` and `sentAt`. Every backend start gets a new `serverInstance`; the sequence starts over. The `/broadcast` endpoint requires a nonempty text string of at most 200 characters.
+Messages contain `id`, `text`, `source`, `serverInstance`, `seq` and `sentAt`. Every backend start gets a new `serverInstance`; the sequence starts over. The `/broadcast` endpoint requires a nonempty text string of at most 200 characters.
 
 This is a loopback-only development example without authentication. Its app permits local networking through App Transport Security, and the backend uses a development-only application key. The iOS Simulator can reach the Mac's loopback address; these instructions are for Simulator use.
 
@@ -32,7 +32,7 @@ open Examples/iOS/TransmitExample.xcodeproj
 
 Choose the **TransmitExample** scheme, select an iPhone Simulator, and run. The project resolves the `Transmit` product from `../..`, the repository root, so changes to the library are used immediately.
 
-Within five seconds of subscribing, timer messages appear. Send a manual broadcast to see it at the top of the list. The app retains the latest 100 messages and logs each received message using the `io.elcubo.TransmitExample` subsystem. Its SwiftUI task owns the subscription and closes the client when the task ends; `onDisappear` also closes it explicitly. The app configures a 90-second SSE read timeout and displays terminal authentication failures.
+After `awaitSubscribed("chats/general")` succeeds, the app publishes "Hello from the SwiftUI client" and receives its own greeting; timer messages follow every five seconds. Send a manual broadcast to see it at the top of the list. The app deduplicates increasing `seq` values per server instance, retains the latest 100 messages and logs each received message using the `io.elcubo.TransmitExample` subsystem. Its SwiftUI task owns the subscription and explicitly unsubscribes and closes the client when the task ends; `onDisappear` also performs that cleanup. The app configures a 90-second SSE read timeout and displays terminal authentication failures.
 
 ## Build, launch and inspect from the terminal
 
@@ -63,7 +63,7 @@ xcrun simctl spawn "$SIMULATOR_ID" log stream --style compact --level info \
   --predicate 'subsystem == "io.elcubo.TransmitExample"'
 ```
 
-The log stream stays open; use another terminal for broadcasts and screenshots. `RECEIVED` lines include the server instance, sequence, text and stable client UID. Use an explicit device UDID when multiple simulators are booted.
+`PUBLISHED after subscription confirmation` confirms the greeting POST was sent after subscription acknowledgement. The log stream stays open; use another terminal for broadcasts and screenshots. `RECEIVED` lines include the server instance, sequence, text and stable client UID. Use an explicit device UDID when multiple simulators are booted.
 
 For another port, start the backend with `PORT=3334 npm start --prefix Examples/Backend`, then launch the app with:
 

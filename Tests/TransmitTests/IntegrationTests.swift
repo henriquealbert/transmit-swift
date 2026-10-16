@@ -75,37 +75,37 @@ final class IntegrationTests: XCTestCase {
             func current() -> String { requests += 1; return requests == 1 ? "expired" : token }
             func set(_ value: String) { token = value }
         }
-        struct Payload: Codable, Sendable, Equatable { let text: String; let number: Int }
+        struct ChatMessage: Codable, Sendable, Equatable { let text: String; let seq: Int }
         let credentials = Credentials()
         await credentials.set("first")
         let client = try TransmitClient(baseURL: base, tokenQueryParameter: "token", session: session,
                                         tokenProvider: { await credentials.current() })
-        let messages = await client.messages(on: "news", as: Payload.self)
+        let messages = await client.messages(on: "chats/general", as: ChatMessage.self)
         let received = expectation(description: "message before and after reconnect and refresh")
         received.expectedFulfillmentCount = 3
         let consumer = Task {
             for try await payload in messages {
-                XCTAssertEqual(payload, Payload(text: "Olá 🌎", number: 7))
+                XCTAssertEqual(payload, ChatMessage(text: "Olá 🌎", seq: 7))
                 received.fulfill()
             }
         }
-        try await client.awaitSubscribed("news")
+        try await client.awaitSubscribed("chats/general")
         let firstSubscription = try await count("subscribe", uid: client.uid)
         XCTAssertEqual(firstSubscription, 1)
-        _ = try await call("broadcast", ["channel": "news", "payload": ["text": "Olá 🌎", "number": 7]])
+        _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
         _ = try await call("control", ["disconnect": true])
         try await eventually { await client.state == .reconnecting }
-        try await client.awaitSubscribed("news")
+        try await client.awaitSubscribed("chats/general")
         let restoredSubscription = try await count("subscribe", uid: client.uid)
         XCTAssertEqual(restoredSubscription, 2)
-        _ = try await call("broadcast", ["channel": "news", "payload": ["text": "Olá 🌎", "number": 7]])
+        _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
         await credentials.set("second")
         _ = try await call("control", ["token": "second"])
         await client.refreshAuthentication()
-        try await client.awaitSubscribed("news")
+        try await client.awaitSubscribed("chats/general")
         let refreshedSubscription = try await count("subscribe", uid: client.uid)
         XCTAssertEqual(refreshedSubscription, 3)
-        _ = try await call("broadcast", ["channel": "news", "payload": ["text": "Olá 🌎", "number": 7]])
+        _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
         await fulfillment(of: [received], timeout: 5)
 
         let rejected = await client.messages(on: "denied", as: Int.self)
@@ -134,8 +134,8 @@ final class IntegrationTests: XCTestCase {
 
         // A persistently rejected real GET must stop instead of retrying forever.
         let anonymous = try TransmitClient(baseURL: base, session: session)
-        let anonymousMessages = await anonymous.messages(on: "news", as: Int.self)
-        do { try await anonymous.awaitSubscribed("news"); XCTFail() }
+        let anonymousMessages = await anonymous.messages(on: "chats/general", as: Int.self)
+        do { try await anonymous.awaitSubscribed("chats/general"); XCTFail() }
         catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
         let anonymousState = await anonymous.state
         XCTAssertEqual(anonymousState, .authenticationFailed)

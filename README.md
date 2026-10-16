@@ -11,7 +11,7 @@ For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example
 Add the package in Xcode, or add it to `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/henriquealbert/transmit-swift.git", from: "0.1.1")
+.package(url: "https://github.com/henriquealbert/transmit-swift.git", from: "0.1.2")
 ```
 
 Add `.product(name: "Transmit", package: "transmit-swift")` to your target's dependencies.
@@ -28,8 +28,8 @@ struct Notification: Codable, Sendable {
 }
 
 let client = try TransmitClient(baseURL: URL(string: "https://api.example.com")!)
-let messages = await client.messages(on: "notifications", as: Notification.self)
-try await client.awaitSubscribed("notifications")
+let messages = await client.messages(on: "users/42/notifications", as: Notification.self)
+try await client.awaitSubscribed("users/42/notifications")
 let listener = Task {
     do {
         for try await message in messages {
@@ -47,13 +47,13 @@ listener.cancel()
 await client.close()
 ```
 
-Each call to `messages` creates an independent consumer. Consumers on the same channel share one server subscription. Cancelling the consuming task removes that consumer; the last consumer's termination sends `POST /__transmit/unsubscribe`. `await client.unsubscribe(from: "notifications")` ends all consumers on that channel. Merely breaking a loop does not reliably terminate an async stream; cancel its task or explicitly unsubscribe.
+Each call to `messages` creates an independent consumer. Consumers on the same channel share one server subscription. Cancelling the consuming task removes that consumer; the last consumer's termination sends `POST /__transmit/unsubscribe`. `await client.unsubscribe(from: "users/42/notifications")` ends all consumers on that channel. Merely breaking a loop does not reliably terminate an async stream; cancel its task or explicitly unsubscribe.
 
 `try await client.awaitSubscribed(channel)` confirms that the subscribe POST succeeded on the current SSE connection. Waiting does not create a subscription implicitly: if there is no consumer yet, it remains pending until a consumer is registered with `messages` and its subscribe POST succeeds. A confirmed active channel returns immediately, and multiple callers can wait independently. Cancelling one wait throws `CancellationError` without removing the consumer or cancelling other waits.
 
 Unsubscribing or ending the last consumer fails pending waits with `TransmitError.notSubscribed(channel)`, including a wait started before a consumer. Subscription failures are retained so even a fast failed POST is reported to a later waiter; registering a new consumer or explicitly unsubscribing clears that failure. Closing fails all pending waits with `closed`, including channels without a consumer, and terminal SSE authentication failure propagates its HTTP error to all waits. Confirmation is invalidated on disconnect or authentication refresh, so await it again before starting new work on the replacement stream. It confirms the connection at that moment; a subsequent network failure is still possible.
 
-Payloads may be objects, arrays, scalars or `null` (use an optional `Decodable` type). Malformed envelopes and ping comments are ignored. A payload decoding error or failed subscription finishes the affected stream with an error. Network failures opening or reading SSE reconnect automatically. Transmit does not replay messages lost during a disconnect. Applications should also tolerate duplicate events after reconnection/resubscription, especially when their backend implements replay or redelivery. Include a stable `seq` field in each payload and deduplicate it per channel or job. A server restart must not reuse sequence values within that same deduplication scope.
+Payloads may be objects, arrays, scalars or `null` (use an optional `Decodable` type). Malformed envelopes and ping comments are ignored. A payload decoding error or failed subscription finishes the affected stream with an error. Network failures opening or reading SSE reconnect automatically. Transmit does not replay messages lost during a disconnect. Applications should also tolerate duplicate events after reconnection/resubscription, especially when their backend implements replay or redelivery. Include a stable `seq` field in each payload and deduplicate it per channel; the chat example below does this. A server restart must not reuse sequence values within that same deduplication scope.
 
 Streams are unbounded by default. To bound a slow consumer's memory, pass `bufferingPolicy: .bufferingNewest(100)`; this intentionally drops older buffered messages. Retain the client for the lifetime of its consumers and call `close()` explicitly for deterministic cleanup. Releasing the last client reference also schedules connection cancellation and finishes its streams; the background loop does not retain the public client. Cleanup from `deinit` is asynchronous, so await `close()` when completion matters. The SwiftUI example also calls `close()` from `onDisappear`.
 
@@ -119,6 +119,97 @@ session.invalidateAndCancel()
 
 Apple defines [`timeoutIntervalForRequest`](https://developer.apple.com/documentation/foundation/urlsessionconfiguration/timeoutintervalforrequest) as the wait for additional data; receiving data resets that timer. `timeoutIntervalForResource` separately limits the whole request's duration, so setting it to 90 seconds would cap the entire SSE connection. Tune that total-duration limit separately if needed. The library leaves an injected session's configuration and lifetime under your control; it does not invalidate a shared session.
 
+## Subscribe, publish and receive a chat message
+
+Use channels such as `chats/general` for chat and `users/42/notifications` for notifications. Transmit carries server-to-client events; publishing from an app uses your own HTTP endpoint. Register the consumer and call `awaitSubscribed(channel)` before that POST so the server subscription is confirmed before publishing. Events arriving during the POST are already buffered by the registered Swift stream.
+
+Here is a small Adonis example for `start/routes.ts`, with Transmit configured and body parsing enabled:
+
+```typescript
+import { randomUUID } from 'node:crypto'
+import router from '@adonisjs/core/services/router'
+import transmit from '@adonisjs/transmit/services/main'
+
+const channel = 'chats/general'
+const serverInstance = randomUUID()
+let seq = 0
+transmit.registerRoutes() // Register once in your application.
+
+router.post('/broadcast', ({ request, response }) => {
+  const text = request.input('text')
+  if (typeof text !== 'string' || !text.trim() || text.length > 200) {
+    return response.badRequest({ error: 'Provide a nonempty text string of at most 200 characters.' })
+  }
+  const message = { id: randomUUID(), text: text.trim(), seq: ++seq, serverInstance }
+  transmit.broadcast(channel, message)
+  return message
+})
+```
+
+The Swift example performs one message round trip, then unsubscribes and closes its client. A continuous chat screen can keep consuming until its task is cancelled. Apply your application's authentication to `/broadcast` and channel authorization to private channels; the Transmit token provider applies only to its own three endpoints.
+
+```swift
+import Foundation
+import Transmit
+
+struct ChatMessage: Decodable, Sendable {
+    let id: String
+    let text: String
+    let seq: Int
+    let serverInstance: String
+}
+
+func sendAndReceive(_ text: String, baseURL: URL) async throws {
+    let configuration = URLSessionConfiguration.default
+    configuration.timeoutIntervalForRequest = 90
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let client = try TransmitClient(baseURL: baseURL, session: session)
+    let channel = "chats/general"
+    let messages = await client.messages(on: channel, as: ChatMessage.self)
+
+    do {
+        try await client.awaitSubscribed(channel)
+        var request = URLRequest(url: baseURL.appendingPathComponent("broadcast"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["text": text])
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else {
+            throw TransmitError.invalidResponse
+        }
+        guard (200..<300).contains(response.statusCode) else {
+            throw TransmitError.httpStatus(response.statusCode)
+        }
+        let published = try JSONDecoder().decode(ChatMessage.self, from: data)
+        var seenSequences: Set<String> = []
+        var received = false
+        for try await message in messages {
+            let key = "\(message.serverInstance):\(message.seq)"
+            guard seenSequences.insert(key).inserted else { continue }
+            print(message.text)
+            if message.id == published.id {
+                received = true
+                break
+            }
+        }
+        try Task.checkCancellation()
+        guard received else { throw TransmitError.closed }
+        await client.unsubscribe(from: channel)
+        await client.close()
+    } catch {
+        await client.unsubscribe(from: channel)
+        await client.close()
+        throw error
+    }
+}
+
+// try await sendAndReceive("Hello from Swift", baseURL: URL(string: "http://127.0.0.1:3333")!)
+```
+
+The `seq` value is scoped to a channel and server instance, so a server restart cannot make new messages look like duplicates. This example does not persist or replay messages missed during an outage. Resubscription restores future delivery; applications that require replay must store messages on the backend and deduplicate redeliveries using stable sequence values. `awaitSubscribed` confirms the current connection only; a later disconnect can still interrupt delivery. A screen can cancel its consuming task when it leaves, and explicitly unsubscribe and close for deterministic cleanup.
+
+See the [runnable chat example](Examples/README.md) for a backend with periodic broadcasts and a SwiftUI app that publishes a greeting after subscription confirmation.
 
 ## Tests and coverage
 
