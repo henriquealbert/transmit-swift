@@ -9,8 +9,9 @@ public actor TransmitClient {
         case idle, connecting, connected, reconnecting, authenticationFailed, closed
     }
 
-    /// Stable for this instance, including reconnects and authentication refreshes.
-    public nonisolated let uid: String
+    /// Identifies the current connection attempt; changes on reconnect and authentication refresh.
+    /// Do not use this as a persistent client or user identity.
+    public nonisolated var uid: String { connection.uid }
     let connection: TransmitConnection
 
     public var state: State { get async { await connection.state } }
@@ -33,8 +34,7 @@ public actor TransmitClient {
     init(baseURL: URL, tokenQueryParameter: String? = nil,
          tokenProvider: @escaping TokenProvider = { nil }, transport: Transport,
          sleep: @escaping @Sendable (UInt64) async throws -> Void) throws {
-        uid = UUID().uuidString
-        connection = try TransmitConnection(uid: uid, baseURL: baseURL,
+        connection = try TransmitConnection(baseURL: baseURL,
             tokenQueryParameter: tokenQueryParameter, tokenProvider: tokenProvider,
             transport: transport, sleep: sleep)
     }
@@ -86,11 +86,30 @@ public actor TransmitClient {
     public func close() async { await connection.close() }
 }
 
+/// A lock preserves synchronous UID reads outside the connection actor.
+private final class StreamIdentity: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = UUID().uuidString
+
+    var uid: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func rotate() {
+        lock.lock()
+        defer { lock.unlock() }
+        value = UUID().uuidString
+    }
+}
+
 /// Separate ownership lets TransmitClient.deinit cancel a loop that is awaiting network I/O.
 actor TransmitConnection {
     private(set) var state: TransmitClient.State = .idle
     private(set) var lastError: (any Error)?
-    private let uid: String
+    private nonisolated let identity = StreamIdentity()
+    nonisolated var uid: String { identity.uid }
     private let baseURL: URL
     private let tokenProvider: TransmitClient.TokenProvider
     private let tokenQueryParameter: String?
@@ -115,7 +134,7 @@ actor TransmitConnection {
         let finish: @Sendable (Error?) -> Void
     }
 
-    init(uid: String, baseURL: URL, tokenQueryParameter: String?,
+    init(baseURL: URL, tokenQueryParameter: String?,
          tokenProvider: @escaping TransmitClient.TokenProvider, transport: Transport,
          sleep: @escaping @Sendable (UInt64) async throws -> Void) throws {
         guard ["http", "https"].contains(baseURL.scheme), baseURL.host != nil,
@@ -123,7 +142,6 @@ actor TransmitConnection {
               baseURL.user == nil, baseURL.password == nil else {
             throw TransmitError.invalidBaseURL
         }
-        self.uid = uid
         self.baseURL = baseURL
         self.tokenQueryParameter = tokenQueryParameter
         self.tokenProvider = tokenProvider
@@ -257,6 +275,7 @@ actor TransmitConnection {
     }
 
     private func request(_ action: String, channel: String? = nil) async throws -> URLRequest {
+        let uid = self.uid
         let token = try await tokenProvider()
         var components = URLComponents(url: baseURL.appendingPathComponent("__transmit/\(action)"),
                                        resolvingAgainstBaseURL: false)!
@@ -312,6 +331,8 @@ actor TransmitConnection {
         var authenticationFailures = 0
         var iterator = commands.makeAsyncIterator()
         while !Task.isCancelled {
+            // Late cleanup of an old stream must never delete its replacement's UID mapping.
+            identity.rotate()
             state = state == .idle ? .connecting : .reconnecting
             var reconnectImmediately = false
             do {

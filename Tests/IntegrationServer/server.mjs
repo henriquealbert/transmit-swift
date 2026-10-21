@@ -31,6 +31,8 @@ const server = await app.container.make('server')
 const router = await app.container.make('router')
 const transmit = await app.container.make('transmit')
 const history = []
+const heldCloses = []
+let holdNextClose = false
 const sockets = new Set()
 const eventSockets = new Set()
 let requiredToken = 'first'
@@ -47,6 +49,17 @@ router.use([() => Promise.resolve({ default: class {
       if (rejectNext) { rejectNext = false; return ctx.response.serviceUnavailable() }
       if (invalidContent) { invalidContent = false; return ctx.response.send('not SSE') }
       if (ctx.request.url().endsWith('/events')) {
+        const response = ctx.response.response
+        const emit = response.emit
+        // Delay the notification, not the socket close, to force late old-stream cleanup.
+        response.emit = function (event, ...args) {
+          if (event === 'close' && holdNextClose) {
+            holdNextClose = false
+            heldCloses.push(() => emit.call(this, event, ...args))
+            return true
+          }
+          return emit.call(this, event, ...args)
+        }
         const socket = ctx.request.request.socket
         eventSockets.add(socket)
         socket.once('close', () => eventSockets.delete(socket))
@@ -63,7 +76,7 @@ router.use([() => Promise.resolve({ default: class {
 } })])
 transmit.registerRoutes()
 transmit.authorize('denied', () => false)
-router.get('/health', () => ({ ok: true }))
+router.get('/health', () => ({ ok: true, heldCloses: heldCloses.length }))
 router.get('/history', () => history)
 router.post('/broadcast', ({ request }) => {
   transmit.broadcast(request.input('channel'), request.input('payload'))
@@ -74,6 +87,10 @@ router.post('/control', ({ request }) => {
   rejectNext = request.input('rejectNext', false)
   invalidContent = request.input('invalidContent', false)
   endNext = request.input('endNext', false)
+  if (request.input('holdNextClose', false)) holdNextClose = true
+  if (request.input('releaseCloses', false)) {
+    for (const release of heldCloses.splice(0)) release()
+  }
   if (request.input('disconnect', false)) {
     for (const socket of eventSockets) socket.destroy()
   }
@@ -88,6 +105,7 @@ await app.start(async () => {
     console.log(`http://127.0.0.1:${http.address().port}`)
   })
   process.on('SIGTERM', async () => {
+    for (const release of heldCloses.splice(0)) release()
     for (const socket of sockets) socket.destroy()
     http.close()
     await app.terminate()
