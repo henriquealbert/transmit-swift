@@ -2,6 +2,7 @@
 .swiftpm/
 .DS_Store
 Tests/IntegrationServer/node_modules/
+Tests/IntegrationServer/.adonisjs/
 Examples/Backend/node_modules/
 xcuserdata/
 *.xcuserstate

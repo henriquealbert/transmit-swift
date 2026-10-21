@@ -2,6 +2,12 @@
   "name": "transmit-swift-integration-server",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.mjs" },
-  "dependencies": { "@adonisjs/core": "^6.14.0", "@adonisjs/transmit": "2.0.2", "reflect-metadata": "^0.2.2" }
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@adonisjs/core": "^7.6.0",
+    "@adonisjs/transmit": "3.0.2",
+    "reflect-metadata": "^0.2.2"
+  }
 }
