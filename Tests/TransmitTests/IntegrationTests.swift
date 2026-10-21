@@ -48,10 +48,11 @@ final class IntegrationTests: XCTestCase {
             let data = try await call("history")
             return try JSONDecoder().decode([RequestRecord].self, from: data)
         }
-        func count(_ path: String, uid: String? = nil) async throws -> Int {
+        func count(_ path: String, uid: String? = nil, channel: String? = nil) async throws -> Int {
             let rows = try await history()
             return rows.filter { row in
                 row.path.hasSuffix(path) && (uid == nil || row.uid == uid)
+                    && (channel == nil || row.body["channel"] == channel)
             }.count
         }
 
@@ -92,6 +93,7 @@ final class IntegrationTests: XCTestCase {
             }
         }
         try await client.awaitSubscribed("chats/general")
+        let firstUID = client.uid
         let firstSubscription = try await count("subscribe", uid: client.uid)
         XCTAssertEqual(firstSubscription, 1)
         _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
@@ -99,16 +101,47 @@ final class IntegrationTests: XCTestCase {
         try await eventually { await client.state == .reconnecting }
         try await client.awaitSubscribed("chats/general")
         let restoredSubscription = try await count("subscribe", uid: client.uid)
-        XCTAssertEqual(restoredSubscription, 2)
+        XCTAssertEqual(restoredSubscription, 1)
+        let restoredUID = client.uid
+        XCTAssertNotEqual(restoredUID, firstUID)
         _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
         await credentials.set("second")
-        _ = try await call("control", ["token": "second"])
+        _ = try await call("control", ["token": "second", "holdNextClose": true])
         await client.refreshAuthentication()
         try await client.awaitSubscribed("chats/general")
         let refreshedSubscription = try await count("subscribe", uid: client.uid)
-        XCTAssertEqual(refreshedSubscription, 3)
+        XCTAssertEqual(refreshedSubscription, 1)
+        let refreshedUID = client.uid
+        XCTAssertNotEqual(refreshedUID, restoredUID)
+        XCTAssertNotEqual(refreshedUID, firstUID)
         _ = try await call("broadcast", ["channel": "chats/general", "payload": ["text": "Olá 🌎", "seq": 7]])
         await fulfillment(of: [received], timeout: 5)
+        // The replacement has subscribed before the old stream removes its UID mapping.
+        try await eventually {
+            let health = try JSONSerialization.jsonObject(with: await call("health")) as? [String: Any]
+            return health?["heldCloses"] as? Int == 1
+        }
+        _ = try await call("control", ["releaseCloses": true])
+        let afterRefresh = await client.messages(on: "after-refresh", as: String.self)
+        do { try await client.awaitSubscribed("after-refresh") }
+        catch {
+            XCTFail("Subscription after delayed old-stream cleanup failed: \(error)")
+            await client.close()
+            consumer.cancel()
+            return
+        }
+        let delivered = expectation(description: "broadcast after old stream cleanup")
+        let lateConsumer = Task {
+            for try await message in afterRefresh {
+                XCTAssertEqual(message, "alive")
+                delivered.fulfill()
+            }
+        }
+        defer { lateConsumer.cancel() }
+        _ = try await call("broadcast", ["channel": "after-refresh", "payload": "alive"])
+        await fulfillment(of: [delivered], timeout: 5)
+        await client.unsubscribe(from: "after-refresh")
+        _ = await lateConsumer.result
 
         let rejected = await client.messages(on: "denied", as: Int.self)
         do { try await client.awaitSubscribed("denied"); XCTFail() }
@@ -117,9 +150,10 @@ final class IntegrationTests: XCTestCase {
         catch { XCTAssertEqual(error as? TransmitError, .httpStatus(400)) }
         consumer.cancel()
         _ = await consumer.result
-        try await eventually { try await count("unsubscribe", uid: client.uid) == 1 }
+        try await eventually { try await count("unsubscribe", uid: client.uid, channel: "chats/general") == 1 }
         let recordedHistory = try await history()
-        let rows = recordedHistory.filter { $0.uid == client.uid }
+        let streamUIDs = Set([firstUID, restoredUID, refreshedUID])
+        let rows = recordedHistory.filter { streamUIDs.contains($0.uid ?? "") }
         XCTAssertGreaterThan(rows.count, 6)
         for row in rows {
             if row.path.hasSuffix("/events") {
@@ -135,6 +169,7 @@ final class IntegrationTests: XCTestCase {
         await client.close()
 
         // A persistently rejected real GET must stop instead of retrying forever.
+        let anonymousStart = try await history().count
         let anonymous = try TransmitClient(baseURL: base, session: session)
         let anonymousMessages = await anonymous.messages(on: "chats/general", as: Int.self)
         do { try await anonymous.awaitSubscribed("chats/general"); XCTFail() }
@@ -145,8 +180,10 @@ final class IntegrationTests: XCTestCase {
         XCTAssertEqual(anonymousError, .httpStatus(401))
         do { for try await _ in anonymousMessages { XCTFail() }; XCTFail() }
         catch { XCTAssertEqual(error as? TransmitError, .httpStatus(401)) }
-        let attempts = try await count("events", uid: anonymous.uid)
-        XCTAssertEqual(attempts, 3)
+        let attempts = try await history().dropFirst(anonymousStart).filter { $0.path.hasSuffix("events") }
+        XCTAssertEqual(attempts.count, 3)
+        XCTAssertEqual(Set(attempts.compactMap(\.uid)).count, 3)
+        XCTAssertEqual(attempts.last?.uid, anonymous.uid)
         await anonymous.close()
     }
 }

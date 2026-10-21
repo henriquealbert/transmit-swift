@@ -2,7 +2,7 @@
 
 A native, zero-dependency Swift client for [AdonisJS Transmit](https://docs.adonisjs.com/guides/digging-deeper/server-sent-events), compatible with the `@adonisjs/transmit-client` 1.x wire protocol. Requires Swift 5.9+, iOS 15+ or macOS 12+.
 
-It uses `URLSession.bytes`, Swift concurrency and typed `AsyncThrowingStream` consumers. One UUID identifies a client across reconnects. Channels subscribe only after the SSE response opens, and active channels are restored after a dropped connection.
+It uses `URLSession.bytes`, Swift concurrency and typed `AsyncThrowingStream` consumers. Each SSE connection attempt uses a fresh UUID. Channels subscribe only after the SSE response opens, and active channels are restored after a dropped connection.
 
 For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example](Examples/README.md), including Simulator and reconnection instructions.
 
@@ -93,6 +93,7 @@ If the backend requires query authentication, pass `tokenQueryParameter: "token"
 
 - `await client.connect()` starts connecting without a subscription; it returns before the stream opens. Otherwise, the first consumer opens `GET {baseURL}/__transmit/events?uid=…` with `Accept: text/event-stream`.
 - Subscriptions use JSON `{ "uid": "…", "channel": "…" }` and the official subscribe/unsubscribe endpoints.
+- `client.uid` is a synchronous, thread-safe getter for the current connection attempt's UUID. It changes whenever reconnect or authentication refresh opens a replacement stream; each stream's subscribe and unsubscribe POSTs use its UID. Do not use it as a persistent client or user identity. Earlier versions reused a single UID across streams, allowing a delayed old-stream close handler to erase the replacement's server mapping. Transmit 3 then rejects new subscriptions with HTTP 400; Transmit 2 can acknowledge an unregistered subscription instead.
 - Retries wait 1, 2, 4, 8, 16, then 30 seconds, capped at 30. Opening the SSE stream resets the delay to one second, even before any event arrives. Explicit authentication refresh while connected reopens immediately without a backoff delay.
 - `await client.state` reports idle, connecting, connected, reconnecting, authenticationFailed or closed. `await client.lastError` exposes the latest SSE opening failure and clears when a stream opens successfully. Connected means the HTTP stream has opened; use `awaitSubscribed(channel)` to confirm a specific channel.
 - `close()` is permanent and idempotent. It ends consumers, cancels the reader and retry delay, and attempts unsubscription. Cleanup POST failures are best effort when offline. Create a new client to start again.
@@ -242,7 +243,7 @@ python3 scripts/check-coverage.py
 rm -rf "$fixture"
 ```
 
-CI runs the build, unit tests, real-server integration and an iOS 15 build against both server combinations using locked dependencies and the same server script. A separate Swift 6 language-mode matrix builds and runs the same tests with complete concurrency checking and compiler warnings treated as errors; all four jobs enforce the coverage gate. The shared fixture supplies AdonisJS 7's required encryption configuration when that API is available. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
+CI runs the build, unit tests, real-server integration and an iOS 15 build against both server combinations using locked dependencies and the same server script. The integration test holds an old stream's close notification until its replacement has subscribed, releases the old cleanup, then verifies a new channel can subscribe and receive a real broadcast. A separate Swift 6 language-mode matrix builds and runs the same tests with complete concurrency checking and compiler warnings treated as errors; all four jobs enforce the coverage gate. The shared fixture supplies AdonisJS 7's required encryption configuration when that API is available. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
 
 ## License
 

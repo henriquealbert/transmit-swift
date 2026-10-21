@@ -159,7 +159,7 @@ final class ClientTests: XCTestCase {
         XCTAssertEqual(finalState, .closed)
     }
 
-    func testReconnectResubscribeAndRefreshWithStableUID() async throws {
+    func testReconnectResubscribeAndRefreshRotateStreamUIDs() async throws {
         actor Token { var value = "old"; func set(_ value: String) { self.value = value } }
         let token = Token(), fake = FakeTransport()
         let client = try client(fake, token: { await token.value }, query: "access_token")
@@ -174,23 +174,29 @@ final class ClientTests: XCTestCase {
         var iterator = stream.makeAsyncIterator()
         let value = try await iterator.next()
         XCTAssertEqual(value, 42)
+        await client.close()
         let requests = await fake.requests
+        var streamUIDs = [String]()
         for request in requests {
             let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
             XCTAssertTrue(components.path.hasPrefix("/api/__transmit/"))
             XCTAssertNotNil(request.value(forHTTPHeaderField: "Authorization"))
             if request.httpMethod == "GET" {
-                XCTAssertEqual(components.queryItems?.first(where: { $0.name == "uid" })?.value, client.uid)
+                let uid = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "uid" })?.value)
+                XCTAssertNotNil(UUID(uuidString: uid))
+                streamUIDs.append(uid)
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream")
             } else {
                 let body = await fake.body(request)
-                XCTAssertEqual(body, ["uid": client.uid, "channel": "news"])
+                XCTAssertEqual(body, ["uid": streamUIDs.last!, "channel": "news"])
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             }
         }
+        XCTAssertEqual(streamUIDs.count, 3)
+        XCTAssertEqual(Set(streamUIDs).count, 3)
+        XCTAssertEqual(client.uid, streamUIDs.last)
         XCTAssertEqual(requests.last?.value(forHTTPHeaderField: "Authorization"), "Bearer new +/=&")
         XCTAssertEqual(URLComponents(url: requests.last!.url!, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, "new +/=&")
-        await client.close()
     }
 
     func testBackoffGrowsAndCapsAndResetsOnOpenWithoutMessages() async throws {
@@ -200,6 +206,10 @@ final class ClientTests: XCTestCase {
         let stream = await client.messages(on: "a", as: Bool.self)
         try await eventually { await fake.count("subscribe") == 1 }
         let delays = await fake.delays
+        let attempts = await fake.requests.filter { $0.httpMethod == "GET" }
+        let attemptUIDs = attempts.map { URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)!.queryItems!.first { $0.name == "uid" }!.value! }
+        XCTAssertEqual(attemptUIDs.count, 8)
+        XCTAssertEqual(Set(attemptUIDs).count, 8)
         XCTAssertEqual(delays, [1, 2, 4, 8, 16, 30, 30].map { UInt64($0) * 1_000_000_000 })
         await fake.end()
         try await eventually { await fake.count("subscribe") == 2 }
