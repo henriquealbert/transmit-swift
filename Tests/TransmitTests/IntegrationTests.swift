@@ -19,7 +19,9 @@ final class IntegrationTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let process = Process(), output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["node", root.appendingPathComponent("IntegrationServer/server.mjs").path]
+        let serverPath = ProcessInfo.processInfo.environment["TRANSMIT_INTEGRATION_SERVER"]
+            ?? root.appendingPathComponent("IntegrationServer/server.mjs").path
+        process.arguments = ["node", serverPath]
         process.standardOutput = output
         try process.run()
         defer { process.terminate(); process.waitUntilExit() }

@@ -6,6 +6,8 @@ It uses `URLSession.bytes`, Swift concurrency and typed `AsyncThrowingStream` co
 
 For a runnable AdonisJS backend and SwiftUI iOS app, see the [end-to-end example](Examples/README.md), including Simulator and reconnection instructions.
 
+Tested against AdonisJS **7.6.0** with `@adonisjs/transmit` **3.0.2**, and AdonisJS **6.21.0** with `@adonisjs/transmit` **2.0.2**. Both combinations run in CI; the Swift client uses the same subscription endpoints, event envelopes, authentication and reconnect behavior for both.
+
 ## Install
 
 Add the package in Xcode, or add it to `Package.swift`:
@@ -220,7 +222,7 @@ swift build
 swift test
 ```
 
-The integration test launches its own loopback-only server on a dynamic port and shuts it down afterward. It runs real AdonisJS 6 routing, body parsing and `@adonisjs/transmit` 2.0.2 controllers, with actual socket disconnects, channel authorization, token rotation and broadcasts. Install Node.js 24 and run:
+The integration test launches its own loopback-only server on a dynamic port and shuts it down afterward. By default it runs real AdonisJS 7.6.0 routing, body parsing and `@adonisjs/transmit` 3.0.2 controllers, with actual socket disconnects, channel authorization, token rotation and broadcasts. Transmit 3.0.2 declares an AdonisJS core peer dependency of `^7.0.0-next`. Install Node.js 24 and run:
 
 ```sh
 npm ci --prefix Tests/IntegrationServer --no-audit --no-fund
@@ -228,7 +230,19 @@ TRANSMIT_INTEGRATION=1 swift test --enable-code-coverage
 python3 scripts/check-coverage.py
 ```
 
-CI runs the build, unit tests, real-server integration and an iOS 15 build. A separate Swift 6 language-mode job builds and runs the same tests with complete concurrency checking and compiler warnings treated as errors; both jobs enforce the coverage gate. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
+The original AdonisJS 6.21.0 / Transmit 2.0.2 dependency manifests and lockfile are retained in `Tests/IntegrationServer/adonis6`. To run that combination without changing the v7 manifests, use a temporary fixture directory:
+
+```sh
+fixture=$(mktemp -d)
+cp Tests/IntegrationServer/adonis6/package{,-lock}.json "$fixture/"
+cp Tests/IntegrationServer/server.mjs "$fixture/"
+(cd "$fixture" && npm ci --no-audit --no-fund)
+TRANSMIT_INTEGRATION=1 TRANSMIT_INTEGRATION_SERVER="$fixture/server.mjs" swift test --enable-code-coverage
+python3 scripts/check-coverage.py
+rm -rf "$fixture"
+```
+
+CI runs the build, unit tests, real-server integration and an iOS 15 build against both server combinations using locked dependencies and the same server script. A separate Swift 6 language-mode matrix builds and runs the same tests with complete concurrency checking and compiler warnings treated as errors; all four jobs enforce the coverage gate. The shared fixture supplies AdonisJS 7's required encryption configuration when that API is available. The coverage gate requires exactly **100% of library lines, functions and regions** in every file under `Sources`, with no source exclusions. Tests and the JavaScript fixture are outside that library metric. Integration is explicitly skipped unless `TRANSMIT_INTEGRATION=1` is set; the coverage command requires it to exercise the live transport.
 
 ## License
 

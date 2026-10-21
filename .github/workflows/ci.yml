@@ -7,15 +7,25 @@ permissions:
   contents: read
 jobs:
   test:
+    name: Tests (AdonisJS ${{ matrix.adonis }})
     runs-on: macos-15
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        adonis: [6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Tests/IntegrationServer/package-lock.json
+          cache-dependency-path: |
+            Tests/IntegrationServer/package-lock.json
+            Tests/IntegrationServer/adonis6/package-lock.json
+      - name: Select AdonisJS 6 fixture
+        if: matrix.adonis == 6
+        run: cp Tests/IntegrationServer/adonis6/package{,-lock}.json Tests/IntegrationServer/
       - name: Build
         run: swift build
       - name: Unit tests
@@ -33,16 +43,25 @@ jobs:
             -derivedDataPath .build/ios IPHONEOS_DEPLOYMENT_TARGET=15.0 \
             CODE_SIGNING_ALLOWED=NO build
   swift6:
-    name: Swift 6 strict concurrency
+    name: Swift 6 strict concurrency (AdonisJS ${{ matrix.adonis }})
     runs-on: macos-15
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        adonis: [6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: Tests/IntegrationServer/package-lock.json
+          cache-dependency-path: |
+            Tests/IntegrationServer/package-lock.json
+            Tests/IntegrationServer/adonis6/package-lock.json
+      - name: Select AdonisJS 6 fixture
+        if: matrix.adonis == 6
+        run: cp Tests/IntegrationServer/adonis6/package{,-lock}.json Tests/IntegrationServer/
       - name: Build in Swift 6 language mode (warnings are errors)
         run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
       - name: Install real AdonisJS integration server
